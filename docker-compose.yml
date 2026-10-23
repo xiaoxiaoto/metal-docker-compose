@@ -1,0 +1,10 @@
+name: local-model-gateway
+
+services:
+  gateway:
+    build: .
+    image: local-model-gateway:local
+    container_name: local-model-gateway
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:80:80"

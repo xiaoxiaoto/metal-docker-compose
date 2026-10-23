@@ -1,0 +1,35 @@
+# Resource-only adaptation of Omni main d6db19b41f8c081506468859cd8f3910f77f1e5c.
+# Requires the private Omni wheel with patches/yue2-mps.patch; verified by check_metal.py.
+pipeline: yue2
+async_chunk: false
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    # NAR/VAE allocate outside this KV budget; retain synthesis/system headroom.
+    gpu_memory_utilization: 0.30
+    enforce_eager: true
+    attention_backend: CUSTOM
+    async_scheduling: false
+    distributed_executor_backend: uni
+    enable_prefix_caching: false
+    max_num_batched_tokens: 4096
+    max_model_len: 24576
+    devices: "0"
+    skip_tokenizer_init: true
+    # EngineArgs resolves non-null tokenizer repo IDs even when initialization is skipped.
+    tokenizer: null
+    hf_overrides:
+      # The checkpoint names YuE2ForCausalLM; use Omni's registered native class.
+      architectures: ["Yue2ForCausalLM"]
+    default_sampling_params:
+      extra_args:
+        yue2_phase: "semantic"
+        yue2_seed: 831001
+        yue2_max_audio_frames: 200
+        yue2_max_hold_steps: 4096
+      detokenize: false
+      stop_token_ids: [151848, 151852]
+      max_tokens: 4297
+      temperature: 1.0

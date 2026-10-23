@@ -1,0 +1,44 @@
+# Local editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+
+# Python environments and generated caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Local credentials and machine-specific environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Model weights, caches and build/runtime output
+.cache/
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.mlmodelc/
+*.mlpackage/
+*.whl
+*.egg-info/
+build/
+dist/
+outputs/
+logs/
+*.log
+
+# One-off deployment verification files
+test_*.py
+*_test.py
+*.test.mjs

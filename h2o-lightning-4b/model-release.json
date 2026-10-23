@@ -1,0 +1,22 @@
+{
+  "repository": "h2oai/h2o-lightning-4b",
+  "revision": "e7b32490c9d2a994bd75a4d1ea7e45716080175e",
+  "weights_version": "v1.3.1",
+  "files": {
+    "assets.py": {"size": 9700, "git_blob": "81997b76bcc1d38f966553be4e249fd3128728d2"},
+    "box.py": {"size": 26900, "git_blob": "ddc4cc8cf0d40db3ca99a83a875eb214ddef9155"},
+    "chat_template.jinja": {"size": 7756, "git_blob": "a585dec894e63da457d9440ec6aa7caa16d20860"},
+    "config.json": {"size": 2872, "git_blob": "8b131a91b46d11f5e04a22e66f9d341ed30ab1bf"},
+    "generation_config.json": {"size": 116, "git_blob": "5c82823157c9f9990e90eac595799b69ce524ac8"},
+    "h2o_lightning_shim.py": {"size": 125215, "git_blob": "1e2ea3207c8cd6af50ea9f4ba5e41c768fc84864"},
+    "merges.txt": {"size": 3353259, "git_blob": "a494e019ca1502219fd0128658b979e5f05ae8e8"},
+    "model.safetensors": {"size": 9319828352, "sha256": "0779980b4335a9decb00db32bd7101e7e2776f061b971d8e42b63920b68d9645"},
+    "pooled_readout.py": {"size": 11981, "git_blob": "158cc0e2f7a57f9005b8874d1301aef6c7d59d88"},
+    "preprocessor_config.json": {"size": 390, "git_blob": "2ea84a437d448ff71b08df68fdd949d5cc4ebb64"},
+    "serve_config.json": {"size": 3830, "git_blob": "5c069439591097c7b727b2232bad6bf8175c56b1"},
+    "tokenizer.json": {"size": 12807982, "sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"},
+    "tokenizer_config.json": {"size": 16710, "git_blob": "eda48d3e75a8e59a8479ee4ec8b37f76e711d9c1"},
+    "video_preprocessor_config.json": {"size": 385, "git_blob": "3ba673a5ad7d4d13f54155ecd38b2a94a6dac8fe"},
+    "vocab.json": {"size": 6722759, "git_blob": "0aa0ce0658d60ac4a5d609f4eadb0e8e43514176"}
+  }
+}

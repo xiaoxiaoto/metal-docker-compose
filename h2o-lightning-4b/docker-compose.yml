@@ -1,0 +1,42 @@
+name: h2o-lightning-shim
+
+services:
+  h2o-shim:
+    build: .
+    image: local/h2o-lightning-shim:metal-modes
+    container_name: h2o-lightning-shim
+    restart: unless-stopped
+
+    working_dir: /app
+
+    volumes:
+      - type: bind
+        source: ${MODEL_MOUNT_DIR:-${HOME}/.cache/huggingface/hub/models--h2oai--h2o-lightning-4b}
+        target: /app/model
+        read_only: true
+        bind:
+          create_host_path: false
+
+    ports:
+      - "127.0.0.1:8740:8741"
+
+    environment:
+      # 同一原生 vLLM Metal 引擎：双向读出、单向读出与 BOX 因果生成。
+      SHIM_TWO_WAY_FLAG: "1"
+      SHIM_ATTENTION_MODE: bidirectional
+      LIGHTNING_BOX_ENABLED: "1"
+
+    command:
+      - python
+      - -u
+      - /app/model/${MODEL_SUBDIR:-snapshots/e7b32490c9d2a994bd75a4d1ea7e45716080175e}/h2o_lightning_shim.py
+      - --config
+      - /app/model/${MODEL_SUBDIR:-snapshots/e7b32490c9d2a994bd75a4d1ea7e45716080175e}/serve_config.json
+      - --vllm
+      - http://host.docker.internal:8000
+      - --model
+      - ${MODEL_NAME:-h2o-lightning-4b}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8741"

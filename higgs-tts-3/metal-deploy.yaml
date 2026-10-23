@@ -1,0 +1,61 @@
+# Derived from upstream deploy/higgs_multimodal_qwen3.yaml; checked against pinned Omni main.
+# Preserve upstream topology, sampling and chunking; change Metal resource settings only.
+async_chunk: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: true
+      codec_chunk_frames: 25
+      codec_left_context_frames: 25
+      codec_right_holdback_frames: 4
+      initial_codec_chunk_frames: 1
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 5000
+      connector_get_max_wait: 500
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.3
+    enforce_eager: true
+    attention_backend: CUSTOM
+    attention_config:
+      use_trtllm_attention: false
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    max_num_batched_tokens: 4096
+    max_model_len: 8192
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 1.0
+      top_p: 0.95
+      top_k: 50
+      max_tokens: 2048
+      seed: 42
+      repetition_penalty: 1.0
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.3
+    enforce_eager: true
+    attention_backend: CUSTOM
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      repetition_penalty: 1.0

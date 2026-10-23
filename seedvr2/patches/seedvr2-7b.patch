@@ -1,0 +1,501 @@
+diff --git a/vllm_omni/diffusion/models/seedvr2/nadit.py b/vllm_omni/diffusion/models/seedvr2/nadit.py
+--- a/vllm_omni/diffusion/models/seedvr2/nadit.py
++++ b/vllm_omni/diffusion/models/seedvr2/nadit.py
+@@ -361,6 +361,44 @@
+         vid_k = apply_rotary_emb(vid_freqs, vid_k.transpose(0, 1)).transpose(0, 1)
+         txt_q = apply_rotary_emb(txt_freqs, txt_q.transpose(0, 1)).transpose(0, 1)
+         txt_k = apply_rotary_emb(txt_freqs, txt_k.transpose(0, 1)).transpose(0, 1)
++        return vid_q, vid_k, txt_q, txt_k
++
++
++class NaVideoRotaryEmbedding3d(NaMMRotaryEmbedding3d):
++    """7B reference pixel RoPE: video only, no text offset or text rotation."""
++
++    mm = False
++
++    def __init__(self, rotary_dim: int) -> None:
++        nn.Module.__init__(self)
++        self.rotary_dim = int(rotary_dim)
++        self.num_axes = 3
++        self.axis_dim = self.rotary_dim // 3
++        self.rot_dim = (self.axis_dim // 2) * 2 * 3
++        if self.rot_dim < 6:
++            raise ValueError("SeedVR2 pixel RoPE needs at least one frequency per axis")
++        self.register_buffer("freqs", torch.linspace(1.0, 128.0, self.axis_dim // 2) * math.pi)
++        self._axis_cache = {}
++
++    def _table(self, dims: tuple[int, ...], *, device, dtype) -> torch.Tensor:
++        axes = []
++        for axis, dim in enumerate(dims):
++            positions = torch.linspace(-1.0, 1.0, steps=dim, device=self.freqs.device)
++            angles = self._axis_angles(positions, device=device, dtype=dtype)
++            shape = [1] * len(dims) + [angles.shape[-1]]
++            shape[axis] = dim
++            axes.append(angles.reshape(shape))
++        return torch.cat(torch.broadcast_tensors(*axes), dim=-1)
++
++    def window_freqs(self, window_shape, text_len, *, device, dtype):
++        return self._table(window_shape, device=device, dtype=dtype).reshape(-1, self.rot_dim)
++
++    def text_freqs(self, text_len, *, device, dtype):
++        return torch.empty((text_len, 0), device=device, dtype=dtype)
++
++    def forward(self, vid_q, vid_k, vid_freqs, txt_q, txt_k, txt_freqs):
++        vid_q = apply_rotary_emb(vid_freqs, vid_q.transpose(0, 1)).transpose(0, 1)
++        vid_k = apply_rotary_emb(vid_freqs, vid_k.transpose(0, 1)).transpose(0, 1)
+         return vid_q, vid_k, txt_q, txt_k
+ 
+ 
+@@ -1435,6 +1473,23 @@
+     "vid_out_norm": True,
+ }
+ 
++# ByteDance-Seed/SeedVR@e4de8c24441a67e1b7df56abea10645059bb1185:
++# configs_7b/main.yaml, models/dit/{nadit,mlp,rope}.py and nablocks/mmsr_block.py.
++# Unlike 3B, 7B retains both streams in every block and has no output norm/Ada.
++SEEDVR2_7B_CONFIG: dict = {
++    **SEEDVR2_3B_CONFIG,
++    "vid_dim": 3072,
++    "heads": 24,
++    "num_layers": 36,
++    "mm_layers": 36,
++    "mlp_type": "normal",
++    "rope_type": "rope3d",
++    "rope_dim": 64,
++    "vid_out_norm": False,
++    "last_layer_vid_only": False,
++    "vid_out_ada": False,
++}
++
+ 
+ # =============================================================================
+ # Reference-faithful building blocks
+@@ -1583,6 +1638,19 @@
+         return self.proj_out(emb)
+ 
+ 
++class NormalMLP(nn.Module):
++    """Reference 7B MLP: biased projections and GELU(tanh), not SwiGLU."""
++
++    def __init__(self, dim: int, expand_ratio: int) -> None:
++        super().__init__()
++        self.proj_in = nn.Linear(dim, dim * expand_ratio)
++        self.act = nn.GELU(approximate="tanh")
++        self.proj_out = nn.Linear(dim * expand_ratio, dim)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return self.proj_out(self.act(self.proj_in(x)))
++
++
+ class SwiGLUMLP(nn.Module):
+     """Reference SwiGLU MLP (``multiple_of=256``, no biases)."""
+ 
+@@ -1651,6 +1719,7 @@
+         qk_norm_eps: float,
+         rope_dim: int,
+         shared_weights: bool,
++        rope_type: str = "mmrope3d",
+         use_varlen_kernel: bool = True,
+     ) -> None:
+         super().__init__()
+@@ -1674,7 +1743,8 @@
+             MMArg(head_dim, head_dim),
+             shared_weights=shared_weights,
+         )
+-        self.rope = NaMMRotaryEmbedding3d(rotary_dim=rope_dim, num_axes=3)
++        rope_cls = NaMMRotaryEmbedding3d if rope_type == "mmrope3d" else NaVideoRotaryEmbedding3d
++        self.rope = rope_cls(rotary_dim=rope_dim)
+         # Window-local attention is communication free by construction, so the
+         # shared layer must never re-shard it through a parallel strategy.
+         self.attention = Attention(
+@@ -1800,10 +1870,13 @@
+         shared_weights: bool,
+         rope_dim: int,
+         is_last_layer: bool,
++        rope_type: str = "mmrope3d",
+         use_varlen_kernel: bool = True,
+     ) -> None:
+         super().__init__()
+-        if mlp_type != "swiglu":
++        mlp_cls = {"swiglu": SwiGLUMLP, "normal": NormalMLP}.get(mlp_type)
++        if mlp_cls is None:
+             raise NotImplementedError(f"unsupported mlp_type {mlp_type!r} for SeedVR2")
+         dims = MMArg(vid_dim, txt_dim)
++        self._fp32_text_residual = mlp_type == "normal"
+         self.attn_norm = MMModule(
+@@ -1817,6 +1890,7 @@
+             qk_bias=qk_bias,
+             qk_norm_eps=norm_eps,
+             rope_dim=rope_dim,
++            rope_type=rope_type,
+             shared_weights=shared_weights,
+             use_varlen_kernel=use_varlen_kernel,
+         )
+@@ -1827,7 +1901,7 @@
+             vid_only=is_last_layer,
+         )
+         self.mlp = MMModule(
+-            lambda d: SwiGLUMLP(int(d), expand_ratio), dims, shared_weights=shared_weights, vid_only=is_last_layer
++            lambda d: mlp_cls(int(d), expand_ratio), dims, shared_weights=shared_weights, vid_only=is_last_layer
+         )
+         self.ada = MMModule(
+             lambda d: AdaSingle(int(d), emb_dim, layers=["attn", "mlp"]),
+@@ -1844,6 +1918,10 @@
+         vid = vid_ada(vid, emb, layer, mode)
+         if txt is not None and not self.ada.vid_only:
+             txt_ada = self.ada.all if self.ada.shared_weights else self.ada.txt
++            # Keep the FP16 text gate product and residual representable.
++            # Normalization precedes the cast back to the projection dtype.
++            if self._fp32_text_residual and emb.dtype == torch.float16:
++                txt = txt.float() if mode == "out" else txt.to(emb.dtype)
+             txt = txt_ada(txt, emb, layer, mode)
+         return vid, txt
+ 
+@@ -1905,10 +1983,12 @@
+         rope_type: str = "mmrope3d",
+         rope_dim: int = 128,
+         vid_out_norm: bool = True,
++        last_layer_vid_only: bool = True,
++        vid_out_ada: bool = True,
+         use_varlen_kernel: bool = True,
+     ) -> None:
+         super().__init__()
+-        if rope_type != "mmrope3d":
++        if rope_type not in ("mmrope3d", "rope3d"):
+             raise NotImplementedError(f"unsupported rope_type {rope_type!r} for SeedVR2")
+         txt_dim = vid_dim
+         emb_dim = emb_dim or 6 * vid_dim
+@@ -1939,7 +2019,8 @@
+                     mlp_type=mlp_type,
+                     shared_weights=not (index < mm_layers),
+                     rope_dim=rope_dim,
+-                    is_last_layer=(index == num_layers - 1),
++                    rope_type=rope_type,
++                    is_last_layer=last_layer_vid_only and (index == num_layers - 1),
+                     use_varlen_kernel=use_varlen_kernel,
+                 )
+                 for index in range(num_layers)
+@@ -1947,7 +2028,7 @@
+         )
+ 
+         self.vid_out_norm = RMSNorm(vid_dim, eps=norm_eps, elementwise_affine=True) if vid_out_norm else None
+-        self.vid_out_ada = OutAda(vid_dim)
++        self.vid_out_ada = OutAda(vid_dim) if vid_out_ada else None
+         self.vid_out = _NaPatchOut(out_channels=vid_out_channels, patch_size=self.patch_size, dim=vid_dim)
+ 
+     # -- runtime -----------------------------------------------------------
+diff --git a/vllm_omni/diffusion/models/seedvr2/pipeline_seedvr2.py b/vllm_omni/diffusion/models/seedvr2/pipeline_seedvr2.py
+--- a/vllm_omni/diffusion/models/seedvr2/pipeline_seedvr2.py
++++ b/vllm_omni/diffusion/models/seedvr2/pipeline_seedvr2.py
+@@ -24,8 +24,19 @@
+ from vllm_omni.diffusion.distributed.utils import get_local_device
+ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+ from vllm_omni.diffusion.models.seedvr2 import config as envs
++from vllm_omni.diffusion.models.seedvr2.comfy import (
++    COMFY_VARIANT,
++    load_seedvr2_weights,
++    read_comfy_conditioning,
++    seedvr2_variant,
++)
+ from vllm_omni.diffusion.models.seedvr2.config import COLOR_CORRECTION_METHODS, DEFAULT_COLOR_CORRECTION_METHOD
+-from vllm_omni.diffusion.models.seedvr2.nadit import SEEDVR2_3B_CONFIG, SeedVR2NaDiT, validate_seedvr2_parallel_config
++from vllm_omni.diffusion.models.seedvr2.nadit import (
++    SEEDVR2_3B_CONFIG,
++    SEEDVR2_7B_CONFIG,
++    SeedVR2NaDiT,
++    validate_seedvr2_parallel_config,
++)
+ from vllm_omni.diffusion.models.seedvr2.vae import SeedVR2VAE
+ from vllm_omni.diffusion.offloader.config import offload_enabled
+ from vllm_omni.diffusion.request import OmniDiffusionRequest
+@@ -377,7 +388,7 @@
+     max_frames()
+     sharded_budget()
+     if config.dtype != torch.float16:
+-        raise ValueError("SeedVR2 3B requires dtype=float16")
++        raise ValueError("SeedVR2 requires dtype=float16")
+     if not config.enforce_eager:
+         raise ValueError("SeedVR2 requires enforce_eager=True; compiled execution is not supported")
+     if config.cache_backend != "none" or config.quantization_config is not None:
+@@ -387,6 +398,9 @@
+     if offload_enabled(config):
+         raise ValueError("SeedVR2 native whole-clip execution does not support CPU offload")
+     parallel = config.parallel_config
++    if seedvr2_variant(config.model) == COMFY_VARIANT:
++        if parallel.ulysses_degree != 1 or parallel.vae_patch_parallel_size != 1:
++            raise ValueError("Comfy SeedVR2 7B overlay supports single-device whole-clip execution only")
+     validate_seedvr2_parallel_config(parallel)
+     if parallel.data_parallel_size is not None and parallel.data_parallel_size > 1:
+         raise ValueError("SeedVR2 does not support data_parallel_size > 1")
+@@ -456,6 +470,7 @@
+     frames: torch.Tensor
+     frame_count: int
+     source: SourceVideo | None = None
++    is_image: bool = False
+ 
+ 
+ def _admission_budget(config: OmniDiffusionConfig) -> tuple[int, int]:
+@@ -488,13 +503,26 @@
+         raise OmniClientError(f"SeedVR2 color_correction_method must be one of {list(COLOR_CORRECTION_METHODS)}")
+     prompt = request.prompt
+     if not isinstance(prompt, dict) or "multi_modal_data" not in prompt:
+-        raise OmniClientError("SeedVR2 requires multi_modal_data.video")
++        raise OmniClientError("SeedVR2 requires multi_modal_data.video or one image")
+     if params.height is None or params.width is None:
+         raise OmniClientError("SeedVR2 requires explicit output height and width")
+     if min(params.height, params.width) < 16 or params.height % 16 or params.width % 16:
+         raise OmniClientError("SeedVR2 output dimensions must be positive multiples of 16")
+     validate_clip_size(1, params.height, params.width, frame_pixels, clip_pixels)
+-    frames = prompt["multi_modal_data"].get("video")
++    media = prompt["multi_modal_data"]
++    if not isinstance(media, dict):
++        raise OmniClientError("SeedVR2 multi_modal_data must be an object")
++    is_image = "image" in media
++    if is_image:
++        if set(media) != {"image"}:
++            raise OmniClientError("SeedVR2 image restoration does not support video, masks or reference images")
++        frames = media["image"]
++        if not isinstance(frames, list) or len(frames) != 1 or not isinstance(frames[0], Image.Image):
++            raise OmniClientError("SeedVR2 image restoration requires exactly one PIL image")
++    else:
++        if set(media) != {"video"}:
++            raise OmniClientError("SeedVR2 requires only video or one image, without masks or references")
++        frames = media["video"]
+     source = None
+     if isinstance(frames, list) and len(frames) == 1 and isinstance(frames[0], (str, Path)):
+         frames = frames[0]
+@@ -516,8 +544,8 @@
+     if (prompt.get("prompt") or "").strip():
+         raise OmniClientError("SeedVR2 uses fixed checkpoint conditioning; prompt text is unsupported")
+     if params.num_outputs_per_prompt != 1:
+-        raise OmniClientError("SeedVR2 produces one restored video per request")
+-    request.prepared_layout = SeedVR2Input(frames, frames.shape[0], source)
++        raise OmniClientError("SeedVR2 produces one restored image or video per request")
++    request.prepared_layout = SeedVR2Input(frames, frames.shape[0], source, is_image=is_image)
+     return request
+ 
+ 
+@@ -534,6 +562,11 @@
+ def _seedvr2_post_process(output: dict[str, object]) -> dict[str, object]:
+     payload = output["payload"]
+     assert isinstance(payload, dict)
++    if "image" in payload:
++        image = payload["image"]
++        assert isinstance(image, torch.Tensor) and image.dtype == torch.uint8 and image.ndim == 4
++        images = [Image.fromarray(frame) for frame in image.cpu().numpy()]
++        return {"payload": {**payload, "image": images}, "metadata": output["metadata"]}
+     video = payload["video"]
+     assert isinstance(video, torch.Tensor) and video.dtype == torch.uint8
+     # The device already produced uint8 [B,T,H,W,3], the layout encoders take.
+@@ -573,6 +606,20 @@
+     return torch.empty_like(condition).normal_(generator=generator)
+ 
+ 
++def restoration_output(video: Tensor, prepared: SeedVR2Input, default_fps: float | None) -> dict[str, object]:
++    if prepared.is_image:
++        if video.shape[1] != 1:
++            raise ValueError("SeedVR2 image output must contain exactly one frame")
++        return {"payload": {"image": video[:, 0]}, "metadata": {}}
++    payload: dict[str, object] = {"video": video}
++    fps = prepared.source.fps if prepared.source is not None else default_fps
++    metadata: dict[str, object] = {"video": {"fps": fps}} if fps is not None else {}
++    if prepared.source is not None and prepared.source.audio is not None:
++        payload["audio"] = prepared.source.audio
++        metadata["audio"] = {"sample_rate": prepared.source.audio_sample_rate}
++    return {"payload": payload, "metadata": metadata}
++
++
+ class SeedVR2Pipeline(nn.Module):
+     supports_request_batch = True
+     _dit_modules: ClassVar[list[str]] = ["transformer"]
+@@ -586,48 +633,55 @@
+         self.device = get_local_device()
+         self.od_config = od_config
+         self.frame_pixels, self.clip_pixels = _admission_budget(od_config)
+-        self.transformer = SeedVR2NaDiT(**SEEDVR2_3B_CONFIG, use_varlen_kernel=False)
++        self.variant = seedvr2_variant(od_config.model)
++        comfy = self.variant == COMFY_VARIANT
++        dit_config = SEEDVR2_7B_CONFIG if comfy else SEEDVR2_3B_CONFIG
++        self.transformer = SeedVR2NaDiT(**dit_config, use_varlen_kernel=False)
+         self.vae = SeedVR2VAE()
++        components = (
++            (
++                ("transformer", "diffusion_models", "seedvr2_7b_fp16.safetensors"),
++                ("vae", "vae", "ema_vae_fp16.safetensors"),
++            )
++            if comfy
++            else (
++                ("transformer", None, "seedvr2_ema_3b_fp16.safetensors"),
++                ("vae", None, "ema_vae_fp16.safetensors"),
++            )
++        )
+         self.weights_sources = [
+             DiffusersPipelineLoader.ComponentSource(
+                 model_or_path=od_config.model,
+-                subfolder=None,
++                subfolder=subfolder,
+                 revision=od_config.revision,
+                 prefix=component + ".",
+                 fall_back_to_pt=False,
+                 allow_patterns_overrides=[filename],
+             )
+-            for component, filename in (
+-                ("transformer", "seedvr2_ema_3b_fp16.safetensors"),
+-                ("vae", "ema_vae_fp16.safetensors"),
+-            )
++            for component, subfolder, filename in components
+         ]
+         model_path = Path(od_config.model)
+-        if not model_path.is_dir():
+-            model_path = Path(
+-                download_weights_from_hf_specific(od_config.model, None, ["pos_emb.pt"], revision=od_config.revision)
++        self._conditioning = None
++        if comfy:
++            self._conditioning = read_comfy_conditioning(
++                model_path / "diffusion_models/seedvr2_7b_fp16.safetensors"
+             )
+-        text = torch.load(model_path / "pos_emb.pt", map_location="cpu", weights_only=True)
+-        if not isinstance(text, torch.Tensor) or text.ndim != 2 or text.shape[1] != 5120 or text.shape[0] == 0:
+-            raise ValueError("SeedVR2 pos_emb.pt must contain a tensor of shape [L,5120]")
++            text = self._conditioning["positive_conditioning"]
++        else:
++            if not model_path.is_dir():
++                model_path = Path(
++                    download_weights_from_hf_specific(od_config.model, None, ["pos_emb.pt"], revision=od_config.revision)
++                )
++            text = torch.load(model_path / "pos_emb.pt", map_location="cpu", weights_only=True)
++            if not isinstance(text, torch.Tensor) or text.ndim != 2 or text.shape[1] != 5120 or text.shape[0] == 0:
++                raise ValueError("SeedVR2 pos_emb.pt must contain a tensor of shape [L,5120]")
+         self.register_buffer("text", text.to(device=self.device, dtype=od_config.dtype), persistent=False)
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+-        targets = self.state_dict()
+-        loaded: set[str] = set()
+-        for name, weight in weights:
+-            if name.endswith(".rope.rope.freqs"):
+-                name = name.removesuffix(".rope.rope.freqs") + ".rope.freqs"
+-            if name not in targets or name in loaded:
+-                raise ValueError(f"Unexpected or duplicate SeedVR2 checkpoint key: {name}")
+-            if targets[name].shape != weight.shape:
+-                raise ValueError(f"SeedVR2 checkpoint shape mismatch for {name}")
+-            targets[name].copy_(weight)
+-            loaded.add(name)
+-        missing = targets.keys() - loaded
+-        if missing:
+-            raise ValueError(f"Missing SeedVR2 checkpoint keys: {sorted(missing)}")
+-        return loaded
++        loaded = load_seedvr2_weights(self, weights, conditioning=self._conditioning)
++        from .quantization import consume_profile
++        consume_profile(self)
++        return loaded
+ 
+     @torch.inference_mode()
+     def forward(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
+@@ -661,11 +715,5 @@
+             decoded = self.vae.decode((restored / 0.9152).permute(3, 0, 1, 2).unsqueeze(0))
+             method = params.extra_args.get("color_correction_method") or DEFAULT_COLOR_CORRECTION_METHOD
+             video = finish_video(decoded, sample, prepared.frame_count, method)
+-            payload: dict[str, object] = {"video": video}
+-            fps = prepared.source.fps if prepared.source is not None else params.fps
+-            metadata: dict[str, object] = {"video": {"fps": fps}} if fps is not None else {}
+-            if prepared.source is not None and prepared.source.audio is not None:
+-                payload["audio"] = prepared.source.audio
+-                metadata["audio"] = {"sample_rate": prepared.source.audio_sample_rate}
+-            outputs.append(DiffusionOutput(output={"payload": payload, "metadata": metadata}))
++            outputs.append(DiffusionOutput(output=restoration_output(video, prepared, params.fps)))
+         return outputs
+diff --git a/vllm_omni/diffusion/models/seedvr2/comfy.py b/vllm_omni/diffusion/models/seedvr2/comfy.py
+new file mode 100644
+--- /dev/null
++++ b/vllm_omni/diffusion/models/seedvr2/comfy.py
+@@ -0,0 +1,80 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
++"""Comfy-Org/SeedVR2 普通 7B FP16 的显式选择与严格 safetensors 加载。"""
++
++import json
++from pathlib import Path
++
++import torch
++from safetensors import safe_open
++
++COMFY_VARIANT = "7b-comfy-fp16"
++CONDITIONING_SHAPES = {"positive_conditioning": (58, 5120), "negative_conditioning": (64, 5120)}
++
++
++def seedvr2_variant(model: str) -> str | None:
++    index = Path(model) / "model_index.json"
++    if not index.is_file():
++        return None  # 上游 3B 仓库仍沿用原有入口。
++    metadata = json.loads(index.read_text())
++    variant = metadata.get("seedvr2_variant")
++    if variant is not None and variant != COMFY_VARIANT:
++        raise ValueError(f"Unsupported SeedVR2 variant: {variant!r}")
++    if variant == COMFY_VARIANT and metadata.get("_class_name") != "SeedVR2Pipeline":
++        raise ValueError("Comfy SeedVR2 7B requires _class_name=SeedVR2Pipeline")
++    return variant
++
++
++def validate_conditioning(name: str, tensor: torch.Tensor) -> None:
++    if tuple(tensor.shape) != CONDITIONING_SHAPES[name] or tensor.dtype != torch.bfloat16:
++        raise ValueError(f"Invalid SeedVR2 {name}: requires BF16 {CONDITIONING_SHAPES[name]}")
++    if not torch.isfinite(tensor).all():
++        raise ValueError(f"Nonfinite SeedVR2 {name}")
++
++
++def read_comfy_conditioning(checkpoint: Path) -> dict[str, torch.Tensor]:
++    # 只取两项小张量；不读取 DiT 全量参数、不执行缓存中的 pickle。
++    result = {}
++    with safe_open(str(checkpoint), framework="pt", device="cpu") as handle:
++        keys = set(handle.keys())
++        for name in CONDITIONING_SHAPES:
++            if name not in keys:
++                raise ValueError(f"Missing SeedVR2 conditioning key: {name}")
++            tensor = handle.get_tensor(name)
++            validate_conditioning(name, tensor)
++            result[name] = tensor
++    return result
++
++
++def load_seedvr2_weights(module, weights, conditioning=None) -> set[str]:
++    targets = module.state_dict()
++    loaded = set()
++    consumed = set()
++    with torch.no_grad():
++        for name, weight in weights:
++            if conditioning is not None and name.startswith("transformer."):
++                key = name.removeprefix("transformer.")
++                if key in CONDITIONING_SHAPES:
++                    if key in consumed:
++                        raise ValueError(f"Duplicate SeedVR2 conditioning key: {name}")
++                    validate_conditioning(key, weight)
++                    if not torch.equal(weight.cpu(), conditioning[key]):
++                        raise ValueError(f"SeedVR2 conditioning changed after initialization: {name}")
++                    consumed.add(key)
++                    continue
++            if name.endswith(".rope.rope.freqs"):
++                name = name.removesuffix(".rope.rope.freqs") + ".rope.freqs"
++            if name not in targets or name in loaded:
++                raise ValueError(f"Unexpected or duplicate SeedVR2 checkpoint key: {name}")
++            if targets[name].shape != weight.shape:
++                raise ValueError(f"SeedVR2 checkpoint shape mismatch for {name}")
++            if conditioning is not None and weight.dtype != torch.float16:
++                raise ValueError(f"SeedVR2 7B checkpoint dtype mismatch for {name}: expected float16")
++            targets[name].copy_(weight)
++            loaded.add(name)
++    missing = targets.keys() - loaded
++    if missing:
++        raise ValueError(f"Missing SeedVR2 checkpoint keys: {sorted(missing)}")
++    if conditioning is not None and consumed != CONDITIONING_SHAPES.keys():
++        raise ValueError(f"Missing SeedVR2 conditioning keys: {sorted(CONDITIONING_SHAPES.keys() - consumed)}")
++    return loaded
+diff --git a/vllm_omni/diffusion/worker/diffusion_worker.py b/vllm_omni/diffusion/worker/diffusion_worker.py
+--- a/vllm_omni/diffusion/worker/diffusion_worker.py
++++ b/vllm_omni/diffusion/worker/diffusion_worker.py
+@@ -1070,2 +1070,6 @@
+         if model_runner is not None:
++            pipeline = getattr(model_runner, "pipeline", None)
++            if getattr(pipeline, "_seedvr2_joint", None) is not None:
++                from vllm_omni.diffusion.models.seedvr2.joint import close
++                close(pipeline)
+             mgr = getattr(model_runner, "kv_transfer_manager", None)

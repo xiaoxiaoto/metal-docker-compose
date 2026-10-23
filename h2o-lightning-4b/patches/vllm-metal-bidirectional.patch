@@ -1,0 +1,1255 @@
+diff --git a/docs/configuration.md b/docs/configuration.md
+index 71a932f..be14972 100644
+--- a/docs/configuration.md
++++ b/docs/configuration.md
+@@ -49,6 +49,39 @@ wins. Outputs are unaffected.
+ 
+ The Gemma 4 vision sidecar sets `disable_chunked_mm_input` on the scheduler config so an image block stays inside one prefill step wherever the scheduler allows (the image-block rows need their whole block in the batch). A block that still ends up split falls back to causal attention for that request, with a `falling back to causal attention` warning; see [Supported Models](supported_models.md).
+ 
++## Per-request Whole-prompt Attention
++
++The MLX backend optionally accepts `vllm_xargs.attention_mode` on generation
++requests. Enable it explicitly with:
++
++```bash
++vllm serve /path/to/model \
++  --additional-config '{"bidirectional_attention": true}' \
++  --no-enable-prefix-caching --no-enable-chunked-prefill \
++  --mamba-cache-mode none \
++  --max-model-len 40960 --max-num-batched-tokens 40960
++```
++
++`"bidirectional"` computes attention over the complete prompt on full-attention
++SDPA layers only; sliding-window and recurrent/Gated DeltaNet layers retain their
++existing semantics. It requires `max_tokens=1`: this is a single-token readout,
++not bidirectional autoregressive generation. The prompt must fit within
++`max_model_len` with room for that token. Requests without the flag stay causal;
++`"causal"` explicitly selects that behavior. Aliases `one-way`, `one_way`,
++`oneway`, `two-way`, `two_way`, and `twoway` follow the same two modes.
++Invalid modes, disabled bidirectional requests and invalid readout lengths
++are API validation errors, not silent causal fallbacks.
++
++The opt-in requires unquantized KV (`--kv-cache-dtype auto`, no TurboQuant), the
++MLX backend, no prefix caching, no chunked prefill, Mamba cache mode `none`, and a
++batch token budget at least as large as `max_model_len`. It rejects speculative
++decoding, pipeline/tensor/data parallelism, KV transfer, pooling and MLA.
++These are explicit startup requirements; the plugin does not silently rewrite
++them. Causal requests on this engine consequently also forego prefix caching.
++The worker rejects any bidirectional cached-prefix, intermediate-chunk or decode
++work that nevertheless reaches execution. Existing image-block ranges remain
++request- and layer-scoped, including in mixed causal/bidirectional batches.
++
+ ## Speculative Decoding
+ 
+ Pass `--speculative-config` with a JSON object to enable speculative decoding.
+diff --git a/tests/attention/test_mm_prefix_kernel.py b/tests/attention/test_mm_prefix_kernel.py
+index fd5ce8e..d21bc0b 100644
+--- a/tests/attention/test_mm_prefix_kernel.py
++++ b/tests/attention/test_mm_prefix_kernel.py
+@@ -559,3 +559,64 @@ def test_all_minus_one_rows_match_the_plain_kernel_bitwise(force_tiled_prefill)
+         **common,
+     )
+     np.testing.assert_array_equal(np.array(got), np.array(plain))
++
++
++@pytest.mark.parametrize("with_image", [False, True])
++def test_request_full_prompt_mixed_batch_matches_sdpa(
++    with_image, force_tiled_prefill
++) -> None:
++    """The flagged segment sees future keys; its causal/image neighbour does not."""
++    from vllm_metal.attention.impls.sdpa import _mm_prefix_rows
++
++    n, hd = 32, 64
++    key, value, query, _ = _setup(42, n=2 * n, seq_len=n, hd=hd)
++    table = mx.array([[1, 2], [3, 4]], dtype=mx.int32)
++    image = [None, [(8, 16)]] if with_image else None
++    ctx = PagedAttentionContext(
++        slot_mapping=[],
++        cu_seqlens=[0, n, 2 * n],
++        context_lens=[n, n],
++        full_prompt_bidi_ranges=[[(0, n)], None],
++        segment_bidi_ranges=image,
++        bidi_layer_kinds=frozenset({"sliding"}) if with_image else frozenset(),
++    )
++    full_rows = _mm_prefix_rows(ctx, "full")
++    common = dict(kv_lens=[n, n], cu_seqlens_q=[0, n, 2 * n], window=None)
++    plain = _kernel(query, key, value, table, **common)
++    got = _kernel(query, key, value, table, ranges=full_rows, **common)
++    keys = mx.array(_rows(key, [1, 2], 0, n), dtype=DTYPE).transpose(1, 0, 2)[None]
++    values = mx.array(_rows(value, [1, 2], 0, n), dtype=DTYPE).transpose(1, 0, 2)[None]
++    expected = mx.fast.scaled_dot_product_attention(
++        query[:n].transpose(1, 0, 2)[None], keys, values, scale=hd**-0.5
++    )[0].transpose(1, 0, 2)
++    mx.eval(expected)
++    np.testing.assert_allclose(np.array(got[:n]), np.array(expected), atol=ATOL, rtol=RTOL)
++    np.testing.assert_array_equal(np.array(got[n:]), np.array(plain[n:]))
++    assert np.max(np.abs(np.array(got[:n]) - np.array(plain[:n]))) > 0.1
++
++    recomputed = apply_bidirectional_segments(
++        plain, query, key, value, block_tables=table, block_size=BLOCK,
++        block_stride=key[0].size, cu_seqlens=[0, n, 2 * n],
++        context_lens=[n, n], ctx=ctx, window=None, scale=hd**-0.5,
++        head_dim=hd, softcap=0.0, sinks=None, turboquant=False,
++        segment_ranges=ctx.bidirectional_ranges("full"),
++    )
++    mx.eval(recomputed)
++    np.testing.assert_allclose(np.array(got), np.array(recomputed), atol=ATOL, rtol=RTOL)
++
++    # Full rows must not leak through the image-only cache, in either order.
++    assert ctx.bidirectional_ranges("sliding") == image
++    if with_image:
++        sliding_rows = _mm_prefix_rows(ctx, "sliding")
++        sliding = _kernel(
++            query, key, value, table, ranges=sliding_rows,
++            kv_lens=[n, n], cu_seqlens_q=[0, n, 2 * n], window=16,
++        )
++        reference = _reference(
++            query[n:], key, value, [3, 4], q_lo=0, seq_len=n,
++            blocks=[(8, 16)], window=16,
++        )
++        np.testing.assert_allclose(np.array(sliding[n:]), reference, atol=ATOL, rtol=RTOL)
++        np.testing.assert_array_equal(
++            np.array(full_rows), np.array(_mm_prefix_rows(ctx, "full"))
++        )
+diff --git a/tests/test_model_lifecycle.py b/tests/test_model_lifecycle.py
+index 7d68e42..8e9da11 100644
+--- a/tests/test_model_lifecycle.py
++++ b/tests/test_model_lifecycle.py
+@@ -269,6 +269,73 @@ class TestModelLifecycle:
+         if backend != "vlm":
+             detect_awq.assert_called_once_with("org/model", revision=revision)
+ 
++    @pytest.mark.parametrize("is_vlm", [False, True])
++    @pytest.mark.parametrize("tied", [False, True])
++    def test_load_applies_fp32_head_without_changing_bf16_backbone(
++        self, monkeypatch: pytest.MonkeyPatch, is_vlm: bool, tied: bool
++    ) -> None:
++        from mlx_lm.models.llama import Model, ModelArgs
++
++        if not mx.metal.is_available():
++            pytest.skip("MLX Metal is not available")
++        model = Model(
++            ModelArgs(
++                model_type="llama",
++                hidden_size=16,
++                num_hidden_layers=1,
++                intermediate_size=32,
++                num_attention_heads=2,
++                rms_norm_eps=1e-5,
++                vocab_size=32,
++                tie_word_embeddings=tied,
++            )
++        )
++        model.set_dtype(mx.bfloat16)
++        model.eval()
++        weight = model.model.embed_tokens.weight
++        backbone_weight = model.model.layers[0].self_attn.q_proj.weight
++        head = model.model.embed_tokens if tied else model.lm_head
++        ids = mx.array([[1, 2, 3]], dtype=mx.int32)
++        hidden = model.model(ids)
++        reference = hidden.astype(mx.float32) @ head.weight.astype(mx.float32).T
++        loaded = SimpleNamespace(language_model=model) if is_vlm else model
++        tokenizer = object()
++        loader = Mock(return_value=(loaded, tokenizer))
++        monkeypatch.setattr(
++            model_lifecycle.AWQQuantLoader, "for_model", Mock(return_value=None)
++        )
++        monkeypatch.setattr(
++            model_lifecycle.GGUFLoadSource,
++            "from_model_config",
++            Mock(return_value=None),
++        )
++        monkeypatch.setattr(ModelLifecycle, "_load_mlx_lm_text_model", loader)
++        monkeypatch.setattr(model_lifecycle, "mlx_vlm_load", loader)
++        lifecycle, _ = _make_lifecycle(
++            model_config=_runner_model_config(
++                dtype=torch.bfloat16,
++                hf_config=SimpleNamespace(
++                    head_dtype="float32",
++                    text_config=SimpleNamespace(head_dtype="float32"),
++                ),
++                is_multimodal_model=is_vlm,
++            )
++        )
++
++        actual_model, actual_tokenizer = lifecycle._load_generation_model(
++            "stub-model", is_vlm
++        )
++
++        assert actual_model is loaded
++        assert actual_tokenizer is tokenizer
++        logits = model(ids)
++        assert logits.dtype == mx.float32
++        assert bool(mx.allclose(logits, reference, rtol=2e-6, atol=2e-6).item())
++        assert model.model.embed_tokens.weight is weight
++        assert model.model.embed_tokens(ids).dtype == mx.bfloat16
++        assert model.model.layers[0].self_attn.q_proj.weight is backbone_weight
++        assert backbone_weight.dtype == mx.bfloat16
++
+     def test_private_mlx_lm_compatible_model_path_adapts_indexed_custom_shards(
+         self, tmp_path: Path
+     ) -> None:
+diff --git a/tests/test_output_head.py b/tests/test_output_head.py
+new file mode 100644
+index 0000000..5d86bce
+--- /dev/null
++++ b/tests/test_output_head.py
+@@ -0,0 +1,276 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Numerical contracts for HF FP32 output heads on real MLX Metal arrays."""
++
++from types import SimpleNamespace
++
++import mlx.core as mx
++import mlx.nn as nn
++import numpy as np
++import pytest
++
++from vllm_metal.v1.model_adapter import DefaultModelAdapter
++from vllm_metal.v1.output_head import install_output_head
++
++
++@pytest.fixture(autouse=True)
++def _metal_device():
++    if not mx.metal.is_available():
++        pytest.skip("MLX Metal is not available")
++    previous = mx.default_device()
++    mx.set_default_device(mx.gpu)
++    yield
++    mx.set_default_device(previous)
++
++
++class _Backbone(nn.Module):
++    def __init__(self, vocab: int, hidden: int):
++        super().__init__()
++        self.embed_tokens = nn.Embedding(vocab, hidden)
++        self.embed_tokens.weight = mx.sin(
++            mx.arange(vocab * hidden, dtype=mx.float32).reshape(vocab, hidden) * 0.31
++        ).astype(mx.bfloat16)
++        self.scale = mx.array(1.125, dtype=mx.bfloat16)
++
++    def __call__(self, ids, cache=None):
++        return self.embed_tokens(ids) * self.scale
++
++
++class _Model(nn.Module):
++    def __init__(self, *, tied=True, bias=False, vocab=23, softcap=None):
++        super().__init__()
++        self.args = SimpleNamespace(tie_word_embeddings=tied)
++        self.model = _Backbone(vocab, 17)
++        if not tied:
++            self.lm_head = nn.Linear(17, vocab, bias=bias)
++            self.lm_head.weight = mx.cos(
++                mx.arange(vocab * 17, dtype=mx.float32).reshape(vocab, 17) * 0.23
++            ).astype(mx.bfloat16)
++            if bias:
++                self.lm_head.bias = mx.sin(mx.arange(vocab) * 0.11).astype(mx.bfloat16)
++        self.final_logit_softcapping = softcap
++
++    def __call__(self, ids, cache=None):
++        hidden = self.model(ids, cache=cache)
++        if self.args.tie_word_embeddings:
++            logits = self.model.embed_tokens.as_linear(hidden)
++        else:
++            logits = self.lm_head(hidden)
++        cap = self.final_logit_softcapping
++        return logits if cap is None else mx.tanh(logits / cap) * cap
++
++
++def _config(**hf_fields):
++    return SimpleNamespace(hf_config=SimpleNamespace(**hf_fields), quantization=None)
++
++
++def _reference(model, hidden):
++    head = model.model.embed_tokens if model.args.tie_word_embeddings else model.lm_head
++    logits = hidden.astype(mx.float32) @ head.weight.astype(mx.float32).T
++    if "bias" in head:
++        logits = logits + head.bias.astype(mx.float32)
++    cap = model.final_logit_softcapping
++    return logits if cap is None else mx.tanh(logits / cap) * cap
++
++
++def _assert_fp32_close(actual, expected):
++    assert actual.dtype == mx.float32
++    np.testing.assert_allclose(np.array(actual), np.array(expected), rtol=2e-6, atol=2e-6)
++
++
++@pytest.mark.parametrize("tied,bias", [(True, False), (False, False), (False, True)])
++@pytest.mark.parametrize("softcap", [None, 3.0])
++def test_native_selected_and_decode_match_fp32_not_bf16_projection(tied, bias, softcap):
++    model = _Model(tied=tied, bias=bias, softcap=softcap)
++    adapter = DefaultModelAdapter()
++    ids = mx.array([[1, 3, 5]], dtype=mx.int32)
++    hidden = model.model(ids)
++    low_precision = model(ids).astype(mx.float32)
++    expected = _reference(model, hidden)
++    # Prove this fixture detects the tempting BF16-matmul-then-cast non-fix.
++    assert mx.max(mx.abs(expected - low_precision)).item() > 1e-4
++    original_weight = model.model.embed_tokens.weight
++    original_scale = model.model.scale
++    original_bytes = np.array(original_weight.view(mx.uint16)).tobytes()
++    lookup = model.model.embed_tokens(ids)
++
++    install_output_head(model, adapter, model_config=_config(head_dtype="float32"))
++
++    _assert_fp32_close(model(ids), expected)
++    _assert_fp32_close(adapter.project_logits(model, hidden), expected)
++    indices = mx.array([0, 2], dtype=mx.int32)
++    _assert_fp32_close(
++        adapter.project_logits(model, hidden, logits_indices=indices),
++        expected[:, [0, 2], :],
++    )
++    output = adapter.target_forward(model, ids, logits_indices=indices)
++    _assert_fp32_close(output.logits, expected[:, [0, 2], :])
++    _assert_fp32_close(model(ids[:, -1:]), _reference(model, model.model(ids[:, -1:])))
++    assert model.model.embed_tokens.weight is original_weight
++    assert model.model.scale is original_scale
++    assert model.model.embed_tokens(ids).dtype == mx.bfloat16
++    assert (
++        np.array(model.model.embed_tokens.weight.view(mx.uint16)).tobytes()
++        == original_bytes
++    )
++    assert bool(mx.array_equal(lookup, model.model.embed_tokens(ids)).item())
++
++
++@pytest.mark.parametrize("tied", [True, False])
++def test_projection_spans_vocabulary_slices_without_changing_stored_weights(tied):
++    model = _Model(tied=tied, bias=not tied, vocab=1027)
++    head = model.model.embed_tokens if tied else model.lm_head
++    weight = head.weight
++    bias = head.get("bias")
++    ids = mx.array([[1, 7]], dtype=mx.int32)
++    expected = _reference(model, model.model(ids))
++
++    install_output_head(
++        model, DefaultModelAdapter(), model_config=_config(head_dtype="float32")
++    )
++
++    _assert_fp32_close(model(ids), expected)
++    head = model.model.embed_tokens if tied else model.lm_head
++    assert head.weight is weight
++    assert head.get("bias") is bias
++    assert head.weight.dtype == mx.bfloat16
++    assert set(head.keys()) == ({"weight"} if tied else {"weight", "bias"})
++
++
++def test_nested_vlm_head_contract_uses_the_same_projection():
++    text_model = _Model()
++    model = SimpleNamespace(language_model=text_model)
++    config = _config(text_config={"head_dtype": "float32"})
++    ids = mx.array([[2, 6]], dtype=mx.int32)
++    expected = _reference(text_model, text_model.model(ids))
++    adapter = DefaultModelAdapter()
++
++    install_output_head(model, adapter, model_config=config)
++
++    _assert_fp32_close(text_model(ids), expected)
++    _assert_fp32_close(adapter.project_logits(model, text_model.model(ids)), expected)
++
++
++def test_missing_head_dtype_does_not_mutate_or_probe_model():
++    model = _Model()
++    embedding = model.model.embed_tokens
++    ids = mx.array([[2]], dtype=mx.int32)
++    reference = model(ids)
++    # An object without adapter methods proves that no precision probe ran.
++    install_output_head(model, object(), model_config=_config())
++    assert model.model.embed_tokens is embedding
++    assert model(ids).dtype == mx.bfloat16
++    assert bool(mx.array_equal(model(ids), reference).item())
++
++
++@pytest.mark.parametrize(
++    "fields",
++    [
++        {"head_dtype": "bfloat16"},
++        {"head_dtype": "float16"},
++        {"head_dtype": "float32", "text_config": {"head_dtype": "bfloat16"}},
++        {"head_dtype": "bfloat16", "text_config": {"head_dtype": "float32"}},
++    ],
++)
++def test_unsupported_or_conflicting_head_dtype_is_rejected(fields):
++    with pytest.raises(ValueError, match="head_dtype"):
++        install_output_head(
++            _Model(), DefaultModelAdapter(), model_config=_config(**fields)
++        )
++
++
++@pytest.mark.parametrize(
++    "combination",
++    [
++        "lora",
++        "quantization",
++        "quantized_head",
++        "custom_head",
++        "compute_logits",
++        "bad_bias",
++    ],
++)
++def test_unsupported_head_combinations_are_rejected(combination):
++    model = _Model(tied=False, bias=True)
++    config = _config(head_dtype="float32")
++    kwargs = {}
++    if combination == "lora":
++        kwargs["lora_config"] = object()
++    elif combination == "quantization":
++        config.hf_config.quantization_config = {"quant_method": "awq"}
++    elif combination == "quantized_head":
++        model.lm_head = nn.QuantizedLinear(64, 23, group_size=64)
++    elif combination == "custom_head":
++
++        class CustomLinear(nn.Linear):
++            pass
++
++        model.lm_head = CustomLinear(17, 23)
++    elif combination == "compute_logits":
++        model.compute_logits = lambda hidden: hidden
++    elif combination == "bad_bias":
++        model.lm_head.bias = mx.zeros((22,))
++    with pytest.raises(ValueError, match="head_dtype"):
++        install_output_head(model, DefaultModelAdapter(), model_config=config, **kwargs)
++
++
++class _BypassingModel(_Model):
++    def __call__(self, ids, cache=None):
++        hidden = self.model(ids, cache=cache)
++        return hidden @ self.model.embed_tokens.weight.T
++
++
++class _ScalingModel(_Model):
++    def __call__(self, ids, cache=None):
++        return super().__call__(ids, cache=cache) * 2.0
++
++
++@pytest.mark.parametrize("model_type", [_BypassingModel, _ScalingModel])
++def test_unsupported_native_head_semantics_fail_loading(model_type):
++    model = model_type()
++    original_embedding = model.model.embed_tokens
++    with pytest.raises(ValueError, match="native/split"):
++        install_output_head(
++            model, DefaultModelAdapter(), model_config=_config(head_dtype="float32")
++        )
++    assert model.model.embed_tokens is original_embedding
++
++
++@pytest.mark.parametrize("invalid", ["shape", "dtype"])
++def test_invalid_projection_input_is_rejected(invalid):
++    model = _Model()
++    install_output_head(
++        model, DefaultModelAdapter(), model_config=_config(head_dtype="float32")
++    )
++    bad_hidden = (
++        mx.zeros((2, 16))
++        if invalid == "shape"
++        else mx.zeros((2, 17), dtype=mx.int32)
++    )
++    with pytest.raises(ValueError, match="hidden"):
++        model.model.embed_tokens.as_linear(bad_hidden)
++
++
++@pytest.mark.parametrize("invalid", ["empty", "integer", "rank"])
++def test_invalid_head_weight_is_rejected(invalid):
++    model = _Model()
++    model.model.embed_tokens.weight = {
++        "empty": mx.zeros((0, 17)),
++        "integer": mx.zeros((23, 17), dtype=mx.int32),
++        "rank": mx.zeros((23,)),
++    }[invalid]
++    with pytest.raises(ValueError, match="head_dtype"):
++        install_output_head(
++            model, DefaultModelAdapter(), model_config=_config(head_dtype="float32")
++        )
++
++
++@pytest.mark.parametrize("tied", [True, False])
++def test_single_hidden_vector_preserves_linear_projection_semantics(tied):
++    model = _Model(tied=tied, bias=not tied)
++    hidden = model.model(mx.array([[3]], dtype=mx.int32))[0, 0]
++    expected = _reference(model, hidden)
++    install_output_head(
++        model, DefaultModelAdapter(), model_config=_config(head_dtype="float32")
++    )
++    project = model.model.embed_tokens.as_linear if tied else model.lm_head
++    _assert_fp32_close(project(hidden), expected)
+diff --git a/tests/test_platform.py b/tests/test_platform.py
+index 9099f56..d0bb2f3 100644
+--- a/tests/test_platform.py
++++ b/tests/test_platform.py
+@@ -2259,3 +2259,107 @@ class TestAutoFitMaxModelLenChain:
+ 
+         with pytest.raises(ValueError, match="Cannot auto-fit max_model_len"):
+             get_kv_cache_configs(vllm_config, [specs], [available])
++
++
++@pytest.mark.parametrize("mode", ["bidirectional", "two-way", "two_way", "twoway"])
++def test_bidirectional_api_requires_opt_in_and_single_readout(monkeypatch, mode):
++    monkeypatch.setattr(MetalPlatform, "_bidirectional_attention_enabled", False)
++    params = SamplingParams(max_tokens=1, extra_args={"attention_mode": mode})
++    inputs = {"prompt_token_ids": [1, 2, 3]}
++    with pytest.raises(VLLMValidationError, match="not enabled"):
++        MetalPlatform.validate_request(inputs, params)
++    monkeypatch.setattr(MetalPlatform, "_bidirectional_attention_enabled", True)
++    monkeypatch.setattr(MetalPlatform, "_bidirectional_max_model_len", 8)
++    MetalPlatform.validate_request(inputs, params)
++    params.max_tokens = 2
++    with pytest.raises(VLLMValidationError, match="max_tokens=1"):
++        MetalPlatform.validate_request(inputs, params)
++    params.max_tokens = 1
++    for tokens in ([], list(range(8))):
++        with pytest.raises(VLLMValidationError, match="whole prompt"):
++            MetalPlatform.validate_request({"prompt_token_ids": tokens}, params)
++
++
++@pytest.mark.parametrize("mode", [None, 1, True, [], {}, "invalid", ""])
++def test_attention_mode_invalid_values_are_api_errors(mode):
++    params = SamplingParams(max_tokens=1, extra_args={"attention_mode": mode})
++    with pytest.raises(VLLMValidationError, match="attention_mode"):
++        MetalPlatform.validate_request({"prompt_token_ids": [1, 2]}, params)
++
++
++@pytest.mark.parametrize("mode", ["causal", "one-way", "one_way", "oneway"])
++def test_causal_aliases_do_not_require_opt_in(monkeypatch, mode):
++    monkeypatch.setattr(MetalPlatform, "_bidirectional_attention_enabled", False)
++    MetalPlatform.validate_request(
++        {"prompt_token_ids": [1, 2]},
++        SamplingParams(max_tokens=5, extra_args={"attention_mode": mode}),
++    )
++    MetalPlatform.validate_request(
++        {"prompt_token_ids": [1, 2]}, SamplingParams(max_tokens=5)
++    )
++
++
++def _whole_prompt_config():
++    return SimpleNamespace(
++        additional_config={"bidirectional_attention": True},
++        cache_config=SimpleNamespace(
++            cache_dtype="auto", enable_prefix_caching=False, mamba_cache_mode="none"
++        ),
++        scheduler_config=SimpleNamespace(
++            enable_chunked_prefill=False, max_num_batched_tokens=32
++        ),
++        parallel_config=SimpleNamespace(
++            pipeline_parallel_size=1, tensor_parallel_size=1, data_parallel_size=1
++        ),
++        model_config=SimpleNamespace(max_model_len=32, runner_type="generate"),
++        speculative_config=None,
++        kv_transfer_config=None,
++    )
++
++
++@pytest.mark.parametrize(
++    "group,field,value,reason",
++    [
++        ("cache_config", "enable_prefix_caching", True, "prefix"),
++        ("cache_config", "mamba_cache_mode", "align", "mamba"),
++        ("cache_config", "cache_dtype", "fp8", "unquantized"),
++        ("scheduler_config", "enable_chunked_prefill", True, "chunked"),
++        ("scheduler_config", "max_num_batched_tokens", 16, "max_model_len"),
++        ("parallel_config", "pipeline_parallel_size", 2, "parallelism"),
++        ("parallel_config", "tensor_parallel_size", 2, "parallelism"),
++        ("parallel_config", "data_parallel_size", 2, "parallelism"),
++        ("model_config", "runner_type", "pooling", "generate"),
++        (None, "speculative_config", object(), "speculative"),
++        (None, "kv_transfer_config", object(), "KV transfer"),
++    ],
++)
++def test_whole_prompt_config_refuses_unsafe_combinations(group, field, value, reason):
++    from vllm_metal.attention.request_mode import validate_bidirectional_config
++
++    config = _whole_prompt_config()
++    assert validate_bidirectional_config(config, backend="mlx", turboquant=False)
++    target = config if group is None else getattr(config, group)
++    setattr(target, field, value)
++    with pytest.raises(ValueError, match=reason):
++        validate_bidirectional_config(config, backend="mlx", turboquant=False)
++
++
++@pytest.mark.parametrize("backend,turboquant", [("mps", False), ("mlx", True)])
++def test_whole_prompt_config_refuses_wrong_backend_or_quantization(backend, turboquant):
++    from vllm_metal.attention.request_mode import validate_bidirectional_config
++
++    with pytest.raises(ValueError, match="bidirectional_attention"):
++        validate_bidirectional_config(
++            _whole_prompt_config(), backend=backend, turboquant=turboquant
++        )
++
++
++def test_whole_prompt_config_is_explicit_boolean_opt_in():
++    from vllm_metal.attention.request_mode import validate_bidirectional_config
++
++    config = _whole_prompt_config()
++    config.additional_config = {}
++    assert not validate_bidirectional_config(config, backend="mlx", turboquant=False)
++    config.additional_config = {"bidirectional_attention": "true"}
++    with pytest.raises(ValueError, match="boolean"):
++        validate_bidirectional_config(config, backend="mlx", turboquant=False)
+diff --git a/tests/v1/mm/test_paged_forward_bidi.py b/tests/v1/mm/test_paged_forward_bidi.py
+index 107e094..be24b6d 100644
+--- a/tests/v1/mm/test_paged_forward_bidi.py
++++ b/tests/v1/mm/test_paged_forward_bidi.py
+@@ -54,6 +54,8 @@ def _capture(adapter: _MmAdapter) -> dict[str, Any]:
+         ctx = get_context()
+         captured["ranges"] = ctx.segment_bidi_ranges
+         captured["kinds"] = ctx.bidi_layer_kinds
++        captured["full_ranges"] = ctx.bidirectional_ranges("full")
++        captured["sliding_ranges"] = ctx.bidirectional_ranges("sliding")
+         return original(*args, **kwargs)
+ 
+     adapter.call_lm = call_lm  # type: ignore[method-assign]
+@@ -396,3 +398,78 @@ class TestLifecycle:
+         )
+         runner._reconcile_request_lifecycle({"req"})
+         assert "req" not in runner._mm_bidi_states
++
++
++@pytest.mark.parametrize("with_image", [False, True])
++def test_whole_prompt_request_survives_text_and_image_forward(with_image):
++    adapter = _BidiAdapter()
++    runner = _runner(adapter)
++    runner._bidirectional_attention_enabled = True
++    prompt = PROMPT if with_image else [1, 2, 3, 4, 5, 6]
++    if with_image:
++        runner.encoder_cache.add_request("req", [_image_feature()])
++        _put_encode(runner, "img-0", hidden_states=mx.ones((2, adapter.hidden_size)))
++    flagged = _mm_prefill(
++        "req", token_ids=prompt, prompt_len=6, full_prompt=prompt
++    )._replace(
++        sampling_params=SamplingParams(
++            max_tokens=1, extra_args={"attention_mode": "bidirectional"}
++        )
++    )
++    plain = _mm_prefill(
++        "plain", token_ids=[1, 2, 3], prompt_len=3, full_prompt=[1, 2, 3]
++    )
++    if with_image:
++        captured = _capture(adapter)
++    else:
++        captured = {}
++        original = runner._target_forward
++
++        def capture(*args, **kwargs):
++            ctx = get_context()
++            captured["full_ranges"] = ctx.bidirectional_ranges("full")
++            captured["sliding_ranges"] = ctx.bidirectional_ranges("sliding")
++            return original(*args, **kwargs)
++
++        runner._target_forward = capture
++    runner._spec_decode_controller.build_decode_segments = MagicMock(return_value=())
++    runner._start_paged_forward(
++        batch=MagicMock(), prefill_reqs=[flagged, plain], decode_reqs=[],
++        scheduler_output=_scheduler_output(),
++    )
++    assert captured["full_ranges"] == [[(0, 6)], None]
++    assert captured["sliding_ranges"] == ([[(2, 4)], None] if with_image else None)
++
++
++@pytest.mark.parametrize(
++    "start,prompt_len,tokens", [(1, 3, [2, 3]), (0, None, [1, 2]), (0, 3, [1, 2])]
++)
++def test_bidirectional_runner_refuses_cache_and_partial_prefill(start, prompt_len, tokens):
++    runner = _runner(_BidiAdapter())
++    runner._bidirectional_attention_enabled = True
++    request = _mm_prefill(
++        "req", token_ids=tokens, prompt_len=prompt_len, start_pos=start,
++        full_prompt=[1, 2, 3],
++    )._replace(
++        sampling_params=SamplingParams(
++            max_tokens=1, extra_args={"attention_mode": "bidirectional"}
++        )
++    )
++    with pytest.raises(RuntimeError, match="fresh whole-prompt"):
++        _forward(runner, request)
++
++
++def test_bidirectional_runner_refuses_decode_before_forward():
++    runner = _runner(_BidiAdapter())
++    runner._bidirectional_attention_enabled = True
++    state = RequestState(
++        token_ids=[1, 2, 3], prompt_len=2,
++        sampling_params=SamplingParams(
++            max_tokens=1, extra_args={"attention_mode": "bidirectional"}
++        ),
++    )
++    with pytest.raises(RuntimeError, match="reached decode"):
++        runner._start_paged_forward(
++            batch=MagicMock(), prefill_reqs=[], decode_reqs=[("req", state)],
++            scheduler_output=_scheduler_output(),
++        )
+diff --git a/vllm_metal/attention/context.py b/vllm_metal/attention/context.py
+index 9e76da8..75d20ce 100644
+--- a/vllm_metal/attention/context.py
++++ b/vllm_metal/attention/context.py
+@@ -100,6 +100,13 @@ class PagedAttentionContext:
+     segment_bidi_ranges: list[list[tuple[int, int]] | None] | None = None
+     # Layer kinds ("sliding", "full") on which the ranges apply; empty = never.
+     bidi_layer_kinds: frozenset[str] = frozenset()
++    # Request-scoped whole-prompt ranges apply only to full SDPA layers.
++    # Kept separate from image ranges: adding "full" to bidi_layer_kinds
++    # would incorrectly promote unmarked image segments on those layers.
++    full_prompt_bidi_ranges: list[list[tuple[int, int]] | None] | None = None
++    full_prompt_mm_rows: Any = None
++    full_prompt_mm_rows_built: bool = False
++    full_prompt_effective_ranges: list[list[tuple[int, int]] | None] | None = None
+     # Anchor the sliding window at each block's first position rather than at
+     # each query row: every row of a block sees the same ``window - 1`` keys
+     # before the block plus the whole block (DiffusionGemma's decoder canvas).
+@@ -156,6 +163,19 @@ class PagedAttentionContext:
+     # batches and prefill subsets are shared only by matching layers.
+     nax_tile_work: Any = None
+ 
++    def bidirectional_ranges(
++        self, kind: str
++    ) -> list[list[tuple[int, int]] | None] | None:
++        image = self.segment_bidi_ranges if kind in self.bidi_layer_kinds else None
++        if kind != "full" or self.full_prompt_bidi_ranges is None:
++            return image
++        if self.full_prompt_effective_ranges is None:
++            self.full_prompt_effective_ranges = [
++                prompt or (image[i] if image is not None else None)
++                for i, prompt in enumerate(self.full_prompt_bidi_ranges)
++            ]
++        return self.full_prompt_effective_ranges
++
+ 
+ def set_context(ctx: PagedAttentionContext) -> None:
+     _thread_local.paged_ctx = ctx
+diff --git a/vllm_metal/attention/impls/bidi_prefill.py b/vllm_metal/attention/impls/bidi_prefill.py
+index 002feab..9f12bc8 100644
+--- a/vllm_metal/attention/impls/bidi_prefill.py
++++ b/vllm_metal/attention/impls/bidi_prefill.py
+@@ -123,6 +123,7 @@ def apply_bidirectional_segments(
+     softcap: float,
+     sinks: mx.array | None,
+     turboquant: bool,
++    segment_ranges: list[list[tuple[int, int]] | None] | None = None,
+ ) -> mx.array:
+     """Recompute the image-block rows of prefill segments and splice them in.
+ 
+@@ -143,7 +144,7 @@ def apply_bidirectional_segments(
+             "bidirectional image attention does not support logit softcap or "
+             "attention sinks"
+         )
+-    per_segment = ctx.segment_bidi_ranges
++    per_segment = segment_ranges if segment_ranges is not None else ctx.segment_bidi_ranges
+     if per_segment is None:
+         return out
+     anchored = ctx.bidi_window_at_block_start
+diff --git a/vllm_metal/attention/impls/sdpa.py b/vllm_metal/attention/impls/sdpa.py
+index 364cd12..43760fa 100644
+--- a/vllm_metal/attention/impls/sdpa.py
++++ b/vllm_metal/attention/impls/sdpa.py
+@@ -193,14 +193,21 @@ def _kernel_metadata(
+     return meta
+ 
+ 
+-def _mm_prefix_rows(ctx: PagedAttentionContext) -> mx.array | None:
+-    """Per-row block ranges for the kernel, built once per forward (see context)."""
++def _mm_prefix_rows(ctx: PagedAttentionContext, kind: str) -> mx.array | None:
++    """Memoize image and full-prompt row sets separately within this forward."""
++    ranges = ctx.bidirectional_ranges(kind)
++    assert ranges is not None
++    assert ctx.cu_seqlens is not None
++    if kind == "full" and ctx.full_prompt_bidi_ranges is not None:
++        if not ctx.full_prompt_mm_rows_built:
++            rows = build_mm_prefix_rows(ctx.cu_seqlens, ctx.context_lens, ranges)
++            if rows is not None:
++                ctx.mm_prefix_row_count = int((rows[:, 0] >= 0).sum())
++            ctx.full_prompt_mm_rows = None if rows is None else mx.array(rows)
++            ctx.full_prompt_mm_rows_built = True
++        return ctx.full_prompt_mm_rows
+     if not ctx.mm_prefix_rows_built:
+-        assert ctx.segment_bidi_ranges is not None
+-        assert ctx.cu_seqlens is not None
+-        rows = build_mm_prefix_rows(
+-            ctx.cu_seqlens, ctx.context_lens, ctx.segment_bidi_ranges
+-        )
++        rows = build_mm_prefix_rows(ctx.cu_seqlens, ctx.context_lens, ranges)
+         if rows is not None:
+             ctx.mm_prefix_row_count = int((rows[:, 0] >= 0).sum())
+             ctx.mm_prefix_rows = mx.array(rows)
+@@ -781,23 +788,23 @@ def sdpa_forward(
+     # window, where the two rules agree.
+     mm_prefix_ranges: mx.array | None = None
+     recompute_after_kernel = False
+-    if ctx.segment_bidi_ranges is not None:
+-        kind = "sliding" if layer_sliding_window >= 0 else "full"
+-        if kind in ctx.bidi_layer_kinds:
+-            assert ctx.cu_seqlens is not None
+-            float32_cache = kernel_k_cache.dtype == mx.float32
+-            if kind == "sliding" and ctx.bidi_window_at_block_start:
+-                recompute_after_kernel = True
+-            elif image_block_path(ops, float32_cache=float32_cache) == "kernel":
+-                mm_prefix_ranges = _mm_prefix_rows(ctx)
+-                if mm_prefix_ranges is not None and not ctx.bidi_logged:
+-                    ctx.bidi_logged = True
+-                    logger.info(
+-                        "Metal: mm_prefix ranges on %d row(s)",
+-                        ctx.mm_prefix_row_count,
+-                    )
+-            else:
+-                recompute_after_kernel = True
++    kind = "sliding" if layer_sliding_window >= 0 else "full"
++    segment_ranges = ctx.bidirectional_ranges(kind)
++    if segment_ranges is not None:
++        assert ctx.cu_seqlens is not None
++        float32_cache = kernel_k_cache.dtype == mx.float32
++        if kind == "sliding" and ctx.bidi_window_at_block_start:
++            recompute_after_kernel = True
++        elif image_block_path(ops, float32_cache=float32_cache) == "kernel":
++            mm_prefix_ranges = _mm_prefix_rows(ctx, kind)
++            if mm_prefix_ranges is not None and not ctx.bidi_logged:
++                ctx.bidi_logged = True
++                logger.info(
++                    "Metal: mm_prefix ranges on %d row(s)",
++                    ctx.mm_prefix_row_count,
++                )
++        else:
++            recompute_after_kernel = True
+     # Only the kernel path passes the ranges, so ops that predate the keyword
+     # still run the kernel for text rows and leave image rows to the recompute.
+     mm_kwargs = (
+@@ -1079,6 +1086,7 @@ def sdpa_forward(
+             softcap=attn_softcap,
+             sinks=sinks,
+             turboquant=kv_cache.turboquant,
++            segment_ranges=segment_ranges,
+         )
+ 
+     # Reshape + strip padding back to actual head_dim before o_proj.
+diff --git a/vllm_metal/attention/request_mode.py b/vllm_metal/attention/request_mode.py
+new file mode 100644
+index 0000000..82c00c9
+--- /dev/null
++++ b/vllm_metal/attention/request_mode.py
+@@ -0,0 +1,120 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Explicit whole-prompt attention contract shared by API and worker."""
++
++from __future__ import annotations
++
++from typing import Any
++
++_MODE_ALIASES = {
++    "causal": "causal",
++    "one-way": "causal",
++    "one_way": "causal",
++    "oneway": "causal",
++    "bidirectional": "bidirectional",
++    "two-way": "bidirectional",
++    "two_way": "bidirectional",
++    "twoway": "bidirectional",
++}
++
++
++def attention_mode(params: Any) -> str:
++    extra = getattr(params, "extra_args", None) or {}
++    if "attention_mode" not in extra:
++        return "causal"
++    value = extra["attention_mode"]
++    if not isinstance(value, str) or value.strip().lower() not in _MODE_ALIASES:
++        raise ValueError(
++            "attention_mode must be causal or bidirectional "
++            "(one-way/two-way aliases accepted)"
++        )
++    return _MODE_ALIASES[value.strip().lower()]
++
++
++def validate_bidirectional_config(config: Any, *, backend: str, turboquant: bool) -> bool:
++    add = config.additional_config or {}
++    enabled = add.get("bidirectional_attention", False)
++    if not isinstance(enabled, bool):
++        raise ValueError("additional_config.bidirectional_attention must be a boolean")
++    if not enabled:
++        return False
++    cache = config.cache_config
++    scheduler = config.scheduler_config
++    parallel = config.parallel_config
++    model = config.model_config
++    unsupported = []
++    for name, invalid in (
++        ("MLX backend required", backend != "mlx"),
++        (
++            "unquantized KV required",
++            turboquant or bool(add.get("turboquant")) or cache.cache_dtype != "auto",
++        ),
++        ("--no-enable-prefix-caching required", cache.enable_prefix_caching),
++        ("--no-enable-chunked-prefill required", scheduler.enable_chunked_prefill),
++        ("--mamba-cache-mode none required", cache.mamba_cache_mode != "none"),
++        (
++            "max_num_batched_tokens must cover a positive max_model_len",
++            model.max_model_len <= 0
++            or scheduler.max_num_batched_tokens < model.max_model_len,
++        ),
++        ("speculative decoding unsupported", config.speculative_config is not None),
++        (
++            "pipeline/tensor/data parallelism unsupported",
++            parallel.pipeline_parallel_size != 1
++            or parallel.tensor_parallel_size != 1
++            or parallel.data_parallel_size != 1,
++        ),
++        (
++            "KV transfer unsupported",
++            getattr(config, "kv_transfer_config", None) is not None,
++        ),
++        ("generate runner required", model.runner_type != "generate"),
++        ("MLA unsupported", bool(getattr(model, "is_deepseek_mla", False))),
++    ):
++        if invalid:
++            unsupported.append(name)
++    if unsupported:
++        raise ValueError("bidirectional_attention: " + "; ".join(unsupported))
++    return True
++
++
++def validate_bidirectional_request(params: Any, *, enabled: bool) -> bool:
++    if attention_mode(params) == "causal":
++        return False
++    if not enabled:
++        raise ValueError(
++            "bidirectional attention is not enabled "
++            "(additional_config.bidirectional_attention)"
++        )
++    if params.max_tokens != 1:
++        raise ValueError(
++            "bidirectional attention requires max_tokens=1 (single-token readout)"
++        )
++    return True
++
++
++def whole_prompt_ranges(
++    prefills: Any, decodes: Any, *, enabled: bool
++) -> list[list[tuple[int, int]] | None] | None:
++    """Reject cached/chunked/decode work before any KV writes occur."""
++    for _, state in decodes:
++        if validate_bidirectional_request(state.sampling_params, enabled=enabled):
++            raise RuntimeError(
++                "bidirectional request reached decode; "
++                "only fresh whole-prompt prefill is supported"
++            )
++    ranges: list[list[tuple[int, int]] | None] = [None] * len(decodes)
++    for request in prefills:
++        if not validate_bidirectional_request(request.sampling_params, enabled=enabled):
++            ranges.append(None)
++            continue
++        n = len(request.token_ids)
++        if request.start_pos != 0 or request.prompt_len != n or n == 0:
++            raise RuntimeError(
++                "bidirectional attention requires fresh whole-prompt prefill: "
++                "cached prefixes and intermediate chunks are unsupported"
++            )
++        full = request.full_prompt_token_ids
++        if full is not None and full != request.token_ids:
++            raise RuntimeError("bidirectional prefill does not match the complete prompt")
++        ranges.append([(0, n)])
++    return ranges if any(ranges) else None
+diff --git a/vllm_metal/platform.py b/vllm_metal/platform.py
+index 0c09c70..3a28b88 100644
+--- a/vllm_metal/platform.py
++++ b/vllm_metal/platform.py
+@@ -112,6 +112,8 @@ class MetalPlatform(Platform):
+     # Whether the configured model is a block-diffusion LM, whose runner has
+     # its own sampler; set by check_and_update_config for validate_request.
+     _serves_diffusion: ClassVar[bool] = False
++    _bidirectional_attention_enabled: ClassVar[bool] = False
++    _bidirectional_max_model_len: ClassVar[int] = 0
+     # Its served canvas_length, recorded by _check_diffusion_config.
+     _diffusion_canvas_length: ClassVar[int | None] = None
+ 
+@@ -338,6 +340,31 @@ class MetalPlatform(Platform):
+         if not isinstance(params, SamplingParams):
+             return
+ 
++        from vllm_metal.attention.request_mode import validate_bidirectional_request
++
++        try:
++            bidirectional = validate_bidirectional_request(
++                params, enabled=cls._bidirectional_attention_enabled
++            )
++            if bidirectional:
++                inputs = processed_inputs
++                if not isinstance(inputs, dict):
++                    raise ValueError("bidirectional attention requires a complete token prompt")
++                tokens = inputs.get("prompt_token_ids")
++                if (
++                    tokens is None
++                    or len(tokens) == 0
++                    or len(tokens) >= cls._bidirectional_max_model_len
++                ):
++                    raise ValueError(
++                        "bidirectional attention requires a nonempty whole prompt "
++                        "with room for one readout token within max_model_len"
++                    )
++        except ValueError as exc:
++            raise VLLMValidationError(
++                str(exc), parameter="attention_mode"
++            ) from exc
++
+         unsupported_controls = [
+             name
+             for name, enabled in (
+@@ -553,6 +580,16 @@ class MetalPlatform(Platform):
+         parallel_config = vllm_config.parallel_config
+         model_config = vllm_config.model_config
+ 
++        from vllm_metal.attention.request_mode import validate_bidirectional_config
++
++        cls._bidirectional_attention_enabled = validate_bidirectional_config(
++            vllm_config, backend=envs.VLLM_METAL_BACKEND,
++            turboquant=config.turboquant,
++        )
++        cls._bidirectional_max_model_len = (
++            model_config.max_model_len if cls._bidirectional_attention_enabled else 0
++        )
++
+         add = vllm_config.additional_config
+         if isinstance(add, dict) and DSPARK_DRAFT_QUANTIZATION_KEY in add:
+             if add[DSPARK_DRAFT_QUANTIZATION_KEY] != DSPARK_DRAFT_QUANTIZATION_Q4:
+diff --git a/vllm_metal/v1/model_lifecycle.py b/vllm_metal/v1/model_lifecycle.py
+index 9edf4b2..eb5f4b4 100644
+--- a/vllm_metal/v1/model_lifecycle.py
++++ b/vllm_metal/v1/model_lifecycle.py
+@@ -30,6 +30,7 @@ from vllm_metal.v1.mlx_lm_paths import (
+ )
+ from vllm_metal.v1.mm import EncoderCache
+ from vllm_metal.v1.model_adapter import ModelAdapter
++from vllm_metal.v1.output_head import install_output_head
+ from vllm_metal.v1.pooling.backends.decoder.factory import (
+     build_decoder_pooling_backend,
+ )
+@@ -421,6 +422,13 @@ class ModelLifecycle:
+                 revision=revision,
+             )
+ 
++        install_output_head(
++            model,
++            self._model_adapter,
++            model_config=model_config,
++            lora_config=getattr(self._runner.vllm_config, "lora_config", None),
++        )
++
+         loaded_from = (
+             gguf_source.weights_path if gguf_source is not None else model_name
+         )
+diff --git a/vllm_metal/v1/model_runner.py b/vllm_metal/v1/model_runner.py
+index 3a58126..39851e1 100644
+--- a/vllm_metal/v1/model_runner.py
++++ b/vllm_metal/v1/model_runner.py
+@@ -395,6 +395,12 @@ class MetalModelRunner:
+         self.scheduler_config = vllm_config.scheduler_config
+         self.use_async_scheduling = bool(self.scheduler_config.async_scheduling)
+         self.metal_config = get_config()
++        from vllm_metal.attention.request_mode import validate_bidirectional_config
++
++        self._bidirectional_attention_enabled = validate_bidirectional_config(
++            vllm_config, backend=envs.VLLM_METAL_BACKEND,
++            turboquant=self.metal_config.turboquant,
++        )
+         # MLX-native sampling key chain (opt-in via VLLM_METAL_NATIVE_SAMPLING).
+         # Derived from the engine seed, so sampling is reproducible for a
+         # fixed request schedule; split once per sampling call. A live key is
+@@ -1479,6 +1485,12 @@ class MetalModelRunner:
+         Stashes all state needed by ``sample_tokens`` in
+         ``_execute_model_state`` (mirrors upstream's pattern).
+         """
++        from vllm_metal.attention.request_mode import whole_prompt_ranges
++
++        prompt_bidi_ranges = whole_prompt_ranges(
++            prefill_reqs, decode_reqs,
++            enabled=getattr(self, "_bidirectional_attention_enabled", False),
++        )
+         decode_segments = self._spec_decode_controller.build_decode_segments(
+             decode_reqs,
+             self._spec_decode_controller.active_spec_decode_tokens(scheduler_output),
+@@ -1586,6 +1598,8 @@ class MetalModelRunner:
+         )
+         try:
+             ctx = get_context()
++            if ctx is not None:
++                ctx.full_prompt_bidi_ranges = prompt_bidi_ranges
+             runtime = self._paged_attention_runtime
+             if runtime is not None and scheduler_output.new_block_ids_to_zero:
+                 runtime.zero_blocks(scheduler_output.new_block_ids_to_zero)
+diff --git a/vllm_metal/v1/output_head.py b/vllm_metal/v1/output_head.py
+new file mode 100644
+index 0000000..b61e8cf
+--- /dev/null
++++ b/vllm_metal/v1/output_head.py
+@@ -0,0 +1,178 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Honor HF ``head_dtype=float32`` without converting stored model weights.
++
++Only ordinary MLX Linear/Embedding heads resolved by the model adapter are
++supported. Native and split forwards must agree at load time, including logit
++postprocessing; custom compute_logits, quantization, and LoRA are rejected.
++Embedding lookup remains in the checkpoint dtype. Projection casts vocabulary
++slices transiently, not an entire persistent FP32 copy of a tied vocabulary.
++"""
++
++from __future__ import annotations
++
++from typing import Any
++
++import mlx.core as mx
++import mlx.nn as nn
++
++from vllm_metal.v1.model_adapter import ModelAdapter
++
++# At hidden size 2560 this bounds a temporary FP32 weight slice to 10 MiB.
++_VOCAB_SLICE_ROWS = 1024
++
++
++def _field(config: Any, name: str) -> Any:
++    return config.get(name) if isinstance(config, dict) else getattr(config, name, None)
++
++
++def _requests_float32_head(model_config: Any) -> bool:
++    config = _field(model_config, "hf_config")
++    text_config = _field(config, "text_config")
++    values = [
++        value
++        for node in (config, text_config)
++        if (value := _field(node, "head_dtype")) is not None
++    ]
++    if not values:
++        return False
++    if any(value != "float32" for value in values):
++        raise ValueError(
++            "Metal supports only head_dtype='float32'; conflicting or unsupported "
++            f"HF head_dtype values: {values!r}"
++        )
++    return True
++
++
++def _project_float32(
++    hidden: mx.array, weight: mx.array, bias: mx.array | None = None
++) -> mx.array:
++    if hidden.dtype not in (mx.bfloat16, mx.float16, mx.float32):
++        raise ValueError("FP32 output projection requires floating-point hidden states")
++    if hidden.ndim < 1 or hidden.shape[-1] != weight.shape[1]:
++        raise ValueError("FP32 output projection hidden-state shape does not match weight")
++    hidden = hidden.astype(mx.float32)
++    parts = []
++    for start in range(0, weight.shape[0], _VOCAB_SLICE_ROWS):
++        stop = start + _VOCAB_SLICE_ROWS
++        part_weight = weight[start:stop].astype(mx.float32)
++        if bias is None:
++            part = hidden @ part_weight.T
++        else:
++            part = mx.addmm(bias[start:stop].astype(mx.float32), hidden, part_weight.T)
++        # MLX is lazy: evaluating each slice releases its cast weight before the
++        # next slice, instead of materializing the full vocabulary in FP32.
++        mx.eval(part)
++        parts.append(part)
++    return parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=-1)
++
++
++class Float32OutputEmbedding(nn.Embedding):
++    """Unchanged lookup/storage, with a genuinely FP32 tied projection."""
++
++    def __init__(self, embedding: nn.Embedding) -> None:
++        nn.Module.__init__(self)
++        self.weight = embedding.weight
++
++    def as_linear(self, hidden: mx.array) -> mx.array:
++        return _project_float32(hidden, self.weight)
++
++
++class Float32OutputLinear(nn.Linear):
++    """Unchanged weight/bias storage, with a genuinely FP32 affine projection."""
++
++    def __init__(self, linear: nn.Linear) -> None:
++        nn.Module.__init__(self)
++        self.weight = linear.weight
++        if "bias" in linear:
++            self.bias = linear.bias
++
++    def __call__(self, hidden: mx.array) -> mx.array:
++        return _project_float32(hidden, self.weight, self.get("bias"))
++
++
++def _validate_weight(head: nn.Module) -> None:
++    weight = head.weight
++    if (
++        weight.ndim != 2
++        or min(weight.shape) == 0
++        or weight.dtype not in (mx.bfloat16, mx.float16, mx.float32)
++    ):
++        raise ValueError("head_dtype='float32' requires a nonempty floating-point matrix")
++    bias = head.get("bias")
++    if bias is not None and (
++        bias.shape != (weight.shape[0],)
++        or bias.dtype not in (mx.bfloat16, mx.float16, mx.float32)
++    ):
++        raise ValueError("head_dtype='float32' requires a floating-point vocabulary bias")
++
++
++def install_output_head(
++    model: Any,
++    adapter: ModelAdapter,
++    *,
++    model_config: Any,
++    lora_config: Any = None,
++) -> None:
++    """Install the requested precision contract after checkpoint dtype conversion.
++
++    No-head-dtype models are untouched. The same module handles full, selected,
++    multimodal, and decode projection; the adapter still owns row selection and
++    logit postprocessing. A native/split parity probe rejects head bypasses and
++    postprocessing the adapter cannot reproduce, rather than silently rounding
++    back to the backbone dtype. This probe runs only at model load, before paged
++    attention contexts exist. No compilation or persistent FP32 weights are used.
++    """
++    if not _requests_float32_head(model_config):
++        return
++    if lora_config is not None:
++        raise ValueError("Metal head_dtype='float32' does not support LoRA")
++    config = _field(model_config, "hf_config")
++    if _field(model_config, "quantization") or any(
++        _field(node, "quantization_config") is not None
++        for node in (config, _field(config, "text_config"))
++    ):
++        raise ValueError("Metal head_dtype='float32' does not support quantized models")
++    if isinstance(model, nn.Module) and any(
++        isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding))
++        for _, module in model.named_modules()
++    ):
++        raise ValueError("Metal head_dtype='float32' does not support quantized models")
++
++    text_model = adapter.text_model(model)
++    if hasattr(text_model, "compute_logits"):
++        raise ValueError("Metal head_dtype='float32' does not support custom compute_logits")
++    args = getattr(text_model, "args", None)
++    tied = bool(
++        getattr(text_model, "tie_word_embeddings", False)
++        or getattr(args, "tie_word_embeddings", False)
++    )
++    head = getattr(text_model, "lm_head", None)
++    replacement: nn.Module
++    if tied or head is None:
++        # Reuse the adapter's text-model resolution, including VLM wrappers.
++        backbone = getattr(text_model, "model", None)
++        head = getattr(backbone, "embed_tokens", None)
++        if type(head) is not nn.Embedding:
++            raise ValueError(
++                "Metal head_dtype='float32' requires an ordinary nn.Embedding tied head"
++            )
++        owner, name = backbone, "embed_tokens"
++        _validate_weight(head)
++        replacement = Float32OutputEmbedding(head)
++    else:
++        if type(head) is not nn.Linear:
++            raise ValueError(
++                "Metal head_dtype='float32' requires an ordinary nn.Linear output head"
++            )
++        owner, name = text_model, "lm_head"
++        _validate_weight(head)
++        replacement = Float32OutputLinear(head)
++
++    setattr(owner, name, replacement)
++    if not adapter.supports_selective_logits(text_model):
++        setattr(owner, name, head)
++        raise ValueError(
++            "Metal head_dtype='float32' requires native/split output-head parity; "
++            "the model bypasses the supported projection or has unsupported "
++            "logit postprocessing"
++        )

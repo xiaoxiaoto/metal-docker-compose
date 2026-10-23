@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moss-vllm-metal"
+version = "0.1.0"
+description = "MOSS adapter for the vLLM Metal one-shot STT runner"
+requires-python = ">=3.12"
+
+[project.entry-points."vllm.general_plugins"]
+moss_stt = "moss_metal:register"
+
+[project.scripts]
+vllm = "vllm.entrypoints.cli.main:main"
+
+[tool.setuptools]
+py-modules = ["moss_metal"]
