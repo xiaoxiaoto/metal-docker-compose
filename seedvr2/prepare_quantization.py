@@ -137,6 +137,52 @@ def stage(args, name):
     write_json(args.output / "stage.json", {"stage": name, "started": time.time()})
 
 
+def capture_candidate(name, original, workloads, run, baseline, directory, *, label, scope):
+    """Capture each complete workload once, then search with bounded disk-backed inputs."""
+    import torch
+
+    from vllm_omni_metal.quantization.capture import DiskCaptures
+    from vllm_omni_metal.quantization.engine import DynamicEngine
+
+    captures = DiskCaptures(
+        {name: original},
+        Path(directory).absolute(),
+        max_bytes=128 * 1024**2,
+        max_disk_bytes=GIB,
+    )
+    holder = {"step": None}
+    recorded = set()
+    hook = None
+
+    def capture(module, inputs):
+        step = holder["step"]
+        if step in recorded:
+            return
+        (activation,) = inputs
+        if activation.dtype != torch.float16:
+            raise ValueError("完整捕获必须保持原始 FP16 dtype")
+        captures.record(name, step, activation)
+        recorded.add(step)
+
+    try:
+        hook = original.register_forward_pre_hook(capture)
+        for step, workload in enumerate(workloads):
+            holder["step"] = step
+            unchanged, _ = run(workload, label)
+            if unchanged.tobytes() != baseline[workload[:2]].tobytes():
+                raise ValueError("捕获改变原始完整 FP16 基线输出")
+        hook.remove()
+        hook = None
+        return DynamicEngine.search({name: original}, captures, scope=scope)
+    finally:
+        if hook is not None:
+            hook.remove()
+        try:
+            write_json(Path(directory).with_suffix(".json"), captures.summary())
+        finally:
+            captures.close()
+
+
 def worker(args):
     import importlib.metadata
 
@@ -341,33 +387,16 @@ def worker(args):
     with torch.inference_mode():
         for index, (name, original) in enumerate(candidates.items()):
             stage(args, f"candidate-{index}-capture")
-            captures = []
-            captured_bytes = 0
-            holder = {"step": None}
-
-            def capture(module, inputs, *, holder=holder, captures=captures):
-                nonlocal captured_bytes
-                step = holder["step"]
-                if any(item[0] == step for item in captures):
-                    return
-                (x,) = inputs
-                size = x.numel() * x.element_size()
-                if x.dtype != torch.float16 or captured_bytes + size > 128 * 1024**2:
-                    raise MemoryError("完整 FP16 captures 超过128MiB；拒绝子采样或改BF16")
-                captures.append((step, x.detach().cpu().contiguous()))
-                captured_bytes += size
-
-            hook = original.register_forward_pre_hook(capture)
-            try:
-                for step_index, workload in enumerate(workloads):
-                    holder["step"] = step_index
-                    unchanged, _ = run(workload, f"candidate-{index}-capture")
-                    if unchanged.tobytes() != baseline[workload[:2]].tobytes():
-                        raise ValueError("捕获改变原始完整 FP16 基线输出")
-            finally:
-                hook.remove()
-            search = DynamicEngine.search({name: original}, {name: captures}, scope=bound_scope)
-            del captures, capture
+            search = capture_candidate(
+                name,
+                original,
+                workloads,
+                run,
+                baseline,
+                args.output / f"capture-{index}",
+                label=f"candidate-{index}-capture",
+                scope=bound_scope,
+            )
             precision = search["precisions"][name]
             bits = {"w4a16": 4, "w8a16": 8, "fp16": 16}[precision]
             quantized = original if bits == 16 else QuantizedLinear.from_linear(original, bits=bits)

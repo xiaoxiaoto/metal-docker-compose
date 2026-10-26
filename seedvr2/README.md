@@ -57,7 +57,7 @@ CPU fallback 或整模型升精度，也不宣称与官方 CUDA BF16 autocast �
 新增数值回归覆盖超过FP16范围的文本残差及下一block归一化/投影边界，
 旧私有wheel重现Inf失败、修复wheel通过；SeedVR2消费者与真实MPS小投影回归
 共32项通过。正常准备器已验证补丁应用、非editable安装、完整RECORD/资源/许可证
-及依赖检查。本次未验证视频、HTTP、ANE或DynamicEngine联合执行，未发布批准profile。
+及依赖检查。上述图片数值修复阶段未验证视频、HTTP、ANE或DynamicEngine联合执行，未发布批准profile；后续HTTP验证见下节。
 已有批准的scope包含全部模型Python源码，精度边界改变后必须重新校准，不能复用旧批准。
 
 
@@ -83,7 +83,7 @@ curl --fail-with-body --show-error --connect-timeout 5 --max-time 10 \
 curl --fail-with-body --show-error --connect-timeout 5 --max-time 1800 \
   'http://127.0.0.1/v1/images/edits' \
   --form 'model=seedvr2' \
-  --form 'prompt= ' \
+  --form-string 'prompt= ' \
   --form 'image=@/实际路径/input.png;type=image/png' \
   --form 'size=512x512' \
   --form 'n=1' \
@@ -111,7 +111,7 @@ curl --fail-with-body --show-error --connect-timeout 5 --max-time 10 \
 curl --fail-with-body --show-error --connect-timeout 5 --max-time 1800 \
   'http://127.0.0.1/v1/videos/sync' \
   --form 'model=seedvr2' \
-  --form 'prompt= ' \
+  --form-string 'prompt= ' \
   --form 'input_references=@/实际路径/short.mp4;type=video/mp4' \
   --form 'size=224x128' \
   --form 'num_inference_steps=1' \
@@ -123,6 +123,29 @@ open /tmp/seedvr2-test.mp4
 ```
 
 `prompt` 必须是单个空格；不传 `fps`，保留输入源 fps。输入使用短 CFR 视频，输出宽高必须为 16 的倍数。视频仅支持 `/v1/videos/sync` 同步短视频；长视频 sharded route 在本单 MPS 部署不支持，不使用 `restore-long`，也不将分片长视频伪装为已支持。响应头与 MP4 保存于 `/tmp/seedvr2-test.headers`、`/tmp/seedvr2-test.mp4`；复测覆盖，不能把 JSON 错误或旧文件当成功。检查 HTTP 200、视频 Content-Type、可解码 MP4、帧数/尺寸/fps/有效画面，并对比输入；HTTP 成功仍不等于画质或性能达标。
+
+### 2026-10-23：原生HTTP图片与派生视频实测
+
+共享扩散runner已修复强制CPU generator导致MPS采样失败的问题；原生seed-only
+请求使用MPS RNG，显式CPU噪声仍受支持，不跳过启动warmup。修复版私有环境为
+`b923e9a3bd43ea71`。上述curl使用`--form-string 'prompt= '`，保留必需的单空格；
+普通`--form`会去除该字段尾随空白，实际返回缺少prompt的HTTP400。
+
+本次通过私有`vllm-omni serve --omni`在空闲18100端口测试，未改现有部署。
+图片输入仍为用户提供的512×512猫图；视频经用户明确授权，从
+`~/Downloads/Mask.mp4`截取前5帧并缩至512×512，保持24fps、原文件不变。
+输出均为624×624，seed7723各重复两次：
+
+| 原生HTTP接口 | 两次端到端耗时 | 输出核验 |
+| --- | --- | --- |
+| `/v1/images/edits` | 18.287 / 18.204秒 | RGB PNG；两次像素SHA256一致 |
+| `/v1/videos/sync` | 65.301 / 64.404秒 | 5帧、24fps MP4；两次解码像素SHA256一致 |
+
+监督最低可用内存约5.49GiB，未触及4GiB停止线；API与引擎正常关闭，
+测试服务退出码0。证据在相邻后端`outputs/seedvr2-http-full-20261023/`。
+这是派生图形短片的实际执行/重复性证明，不代表原1024×1024、140帧视频、
+自然视频质量或ANE＋DynamicEngine联合批准；不据单次耗时宣称加速。
+
 
 ## 无副作用检查与验证记录
 
@@ -153,11 +176,11 @@ Shell/JS/Python 语法、两份 Compose 配置、无副作用帮助入口通过�
 
 ### 准备和完整校准命令
 
-以下命令由操作者串行执行；会构建私有 wheel / 加载真实 7B，但**不启停服务、不下载模型、不调用共享 prepare/update、不停止 YuE2 或其它服务**。固定基础环境为已有的 `runtime/7cbda79691696d01`，不可用时明确失败，不切换到不兼容 commit。
+以下命令由操作者串行执行；会构建私有 wheel / 加载真实 7B，但**不启停服务、不下载模型、不调用共享 prepare/update、不停止 YuE2 或其它服务**。本次选定已有基础环境为 `runtime/0e63615c03ef50e1`，准备器仍严格核对官方 Omni 固定 commit；不可用或不兼容时明确失败，不自动切换共享环境。
 
 ```bash
 # 从 docker-compose 根目录执行；只构建本模型拥有的私有 overlay。
-base="$HOME/.local/share/local-model-backend/runtime/7cbda79691696d01/bin/python"
+base="$HOME/.local/share/local-model-backend/runtime/0e63615c03ef50e1/bin/python"
 runtime="$(VLLM_BACKEND_PYTHON="$base" "$base" -I seedvr2/prepare_runtime.py)"
 
 # 权重必须预先完整存在，且 model_index.json 已经由本目录 prepare.py 正确建立。
@@ -175,7 +198,7 @@ VLLM_BACKEND_PYTHON="$base" ./seedvr2/start.sh --quantization off
 # 明确启用时另传 --quantization dynamic --quantization-profile /实际批准路径
 ```
 
-离线工具在任何模型加载前核对固定发布完整 SHA256 和索引；不将3B缓存当7B，不自动生成、裁剪或缩小输入。真实图片一帧和最小合法5帧CFR视频，各跑 seed 7723/7724，输出宽高均须大于输入。每候选从四次真实完整生成各捕获一次原 dtype、完整 shape CPU FP16 激活，step 0/1/2/3，总计最多128MiB，超限拒绝，不抽样或转BF16；捕获不得改变完整原精度输出。DynamicEngine 分别实测 W4/W8 并允许保留FP16。选中精度随后在原模型每次实际投影 hook 上重新比较完整输出，保留两输入/两seed的全部实际calls和局部双1%门槛；原始基线正反序同seed须逐位一致。
+离线工具在任何模型加载前核对固定发布完整 SHA256 和索引；不将3B缓存当7B，不自动生成、裁剪或缩小输入。真实图片一帧和最小合法5帧CFR视频，各跑 seed 7723/7724，输出宽高均须大于输入。每候选从四次真实完整生成各捕获首个原 dtype、完整 shape FP16 激活，step 0/1/2/3，使用独立 owned0700 `capture-N` 目录和非 pickle owned0600 文件有界落盘：单个完整 CPU 激活仍最多128MiB，总落盘最多1GiB，不抽样、不转BF16、不提高内存上限。DynamicEngine 一次读取一个完整激活，逐步实测 W4/W8 并允许保留FP16，不建立全样本 CPU/GPU 输入或参考输出列表。成功或失败均移除捕获 hook、关闭并清理本候选临时存储；`capture-N.json` 保留严格JSON的shape、dtype、step及完整性指纹元数据，不保留激活。捕获不得改变完整原精度输出。选中精度随后在原模型每次实际投影 hook 上重新比较完整输出，保留两输入/两seed的全部实际calls和局部双1%门槛；原始基线正反序同seed须逐位一致。
 
 每个局部合格候选都运行完整 VAE encode → DiT → VAE decode → 原生颜色校正/RGB 输出与完整重复生成；最终 relative L2 与按参考 peak 归一 max-abs 均不超过1%，各样本实际投影 calls >0。有限候选中按完整输出最坏误差选一个（不强制所有候选量化）。量化路径检查所选原浮点 module/weight 弱引用均消失；FP16 identity 明确保留原模块。反序完整复验须与候选输出逐位一致，再从原 safetensors 重读所选投影、保持选中精度和引擎审计重建最终摘要。父监督器确认零退出后才同目录原子 no-replace 发布 owned0600 批准文件；已有路径/符号链接拒绝、不覆盖。失败只保留证据，不发布或自动启用。
 
@@ -183,7 +206,16 @@ profile 绑定两份完整真实权重路径/发布哈希、索引、私有模�
 
 离线启动要求 **available RAM ≥ 权重总字节 +10GiB**（约25.82GiB），Metal 推荐预算 ≥ 权重+4GiB；运行期间 available ≥4GiB、被监督校准进程树 RSS ≤权重+10GiB、磁盘剩余 ≥2GiB。总校准最长7200秒，单阶段最长1800秒。仅终止自己创建的校准子进程，不降低门槛、不改变水位、不向其它服务发信号。这些保守预算不是实测峰值保证；量化发生在完整 FP16 加载后，不能宣称流式低峰值加载。
 
-### 当前可达性和未验收边界
+2026-10-23：私有 runtime `b923e9a3bd43ea71` 的真实 HTTP 原图及用户授权派生五帧视频生成、同seed复验已通过，证据为相邻后端 `outputs/seedvr2-http-full-20261023/`。随后完整 joint 校准在 `outputs/seedvr2-joint-full-20261023/stage.json` 的 `candidate-0-capture-video-7723` 因旧版四样本合计128MiB CPU捕获门禁拒绝，尚未开始search/ANE，不是联合质量或速度通过。
+
+2026-10-24：有界落盘和流式搜索已安装至独立 runtime `32d4415b8e04479a`，正常准备器ready复用及ANE工具准备通过。因GitHub传输失败，Omni由已核验整包SHA256、完整RECORD、同一固定commit与7B补丁的缓存纯Pythonwheel更新当前校准资源后重新打包，**不是全新Omni源码构建**；后端wheel仍从干净当前源码构建。离线来源记录见相邻后端 `outputs/seedvr2-stream-install-20261023/offline-wheel-source.json`。
+
+本轮完整真实校准证据为 `outputs/seedvr2-joint-streamed-20261024/`：四个原精度workload均已输出，停在 `baseline-repeat-video-7724`，运行约293秒后available降至2564866048字节（2.39GiB），低于4GiB停止线；监督器终止本次子进程，退出码-15。**尚未进入捕获、search或ANE联合执行，未发布批准或自动启用服务**。完整模型上的流式路径、双1%质量、相同量化GPU对照稳定快3%及联合生命周期仍未验收；不会降低输入、四workload或资源门槛。后端递归来源指纹、ready/RECORD及校准器ASSETS绑定覆盖新API与资源，旧实现批准不可迁移。
+
+### 2026-10-22历史可达性记录（当前已补齐7B）
+
+以下缺权重结果仅为当时记录。2026-10-23固定7B与VAE已完整下载并通过校验，
+不能再把下列历史拒绝当作当前缺权重证据；实际图片/HTTP验证见上文。
 
 本次定向检查：默认 ModelScope `Comfy-Org/SeedVR2`、SeedVR2 私有 overlay、`~/Library/Application Support/seedvr2` 和对应 LaunchAgent 均未发现部署；没有提供自定义 SeedVR2 路径。已有 HF `models--numz--SeedVR2_comfyUI/snapshots/09ced71023636e9bc8cdf9cdecfb2625d1e691e8` 仅列出 `seedvr2_ema_3b_fp16.safetensors` 与 VAE，不能替代缺失的固定 7B DiT。还定向检查了 `~/Models` 的 SeedVR2 名称、HF/ModelScope SeedVR2 命名缓存；未全盘扫描或读取私人照片库。
 

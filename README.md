@@ -164,6 +164,8 @@ Higgs / YuE2 / MOSS 已移除各自的纯 Nginx Compose，不再使用原来的�
 
 启动resident模型（包括含resident的 `all`）或为缺少plist的dynamic模型自动准备时，运行 `prepare_backend.py`。仅gateway/lifecycle和已有dynamic部署的登记不准备或升级后端。动态HTTP冷启动直接复用已准备plist；准备/升级只在显式执行启动脚本时进行，不能在模型请求里触发。
 
+后端准备器通过 Python 标准库读取 macOS 系统 HTTP/HTTPS 代理，并传给 Git、uv 和 pip 子进程；已有同名大小写代理环境变量（包括空值）优先，不硬编码本机端口、不关闭 TLS 校验。代理只作用于准备器及其子进程，不写入模型 launchd 配置。若配置了代理，请确认代理程序正在运行；后端准备完成前，首次 `./start.sh h2o` 尚不会启动网关，此时直接 curl 统一入口会连接失败，不能视为模型推理错误。
+
 1. 从官方 Git 仓库查询 vLLM / vLLM Metal 最新稳定标签和 Omni 最新 `main` commit；网络失败直接中止，不静默跳过。
 2. 校验兼容版本组：vLLM `0.32.0+cpu`、Metal `0.32.0`、官方 Omni main 开发快照 `0.32.0.dev0+cpu`、Omni Metal `0.32.0.dev0`。当前 Omni main 为 `d6db19b41f8c081506468859cd8f3910f77f1e5c`；vLLM/Metal 0.32 要求 Transformers `>=5.16.1,<5.20.0`，旧 Omni 0.31 的 `<5.15` 冲突，因此必须整组升级，不逐包混装。新官方核心超出兼容矩阵时拒绝启动，须先更新 wheel pins / 插件依赖 / 版本校验并重新验证。
 3. 如官方 Omni commit、后端源码、版本组或后端位置变化，先停止本部署已注册的模型，再在 `~/.local/share/local-model-backend/runtime/<fingerprint>/` 构建新隔离环境。YuE2、MOSS、QwenImage 与 SeedVR2 私有 overlay 位于同一根目录的 `overlays/<model>/<fingerprint>/`。失败不激活新环境、不启动模型；旧环境和模型缓存保留，不修改 Homebrew、系统 Python 或其他项目容器。
@@ -193,7 +195,7 @@ curl --fail-with-body --show-error --connect-timeout 5 --max-time 10 \
 
 来源：[H2O.ai 官方模型卡](https://huggingface.co/h2oai/h2o-lightning-4b)。当前官方权重为 **v1.3.1**，本机权重、配置与新版 shim/tooling 统一固定为 main commit [`e7b32490c9d2a994bd75a4d1ea7e45716080175e`](https://huggingface.co/h2oai/h2o-lightning-4b/tree/e7b32490c9d2a994bd75a4d1ea7e45716080175e)，不单独下载 tag 的旧 tooling。规范对外模型 ID 仍为 `h2o-lightning-4b`。
 
-**本次仅升级代码，模型以后由用户通过 Hugging Face 手动下载。** 默认读取 HF 标准缓存 `~/.cache/huggingface/hub/models--h2oai--h2o-lightning-4b/snapshots/<上述 commit>/`，支持 `HF_HUB_CACHE`、`HF_HOME`、`XDG_CACHE_HOME`；可通过 `H2O_MODEL_DIR` 指定 `hf download --local-dir` 的完整目录。旧魔搭镜像缓存不删除、不自动选择。稍后手动执行（主权重约9.32GB，本次未执行）：
+模型由用户通过 Hugging Face 手动下载，启动器不自动下载权重。默认读取 HF 标准缓存 `~/.cache/huggingface/hub/models--h2oai--h2o-lightning-4b/snapshots/<上述 commit>/`，支持 `HF_HUB_CACHE`、`HF_HOME`、`XDG_CACHE_HOME`；可通过 `H2O_MODEL_DIR` 指定 `hf download --local-dir` 的完整目录。旧魔搭镜像缓存不删除、不自动选择。缺少发布文件时手动执行（主权重约9.32GB）：
 
 ```bash
 hf download h2oai/h2o-lightning-4b \
@@ -207,9 +209,9 @@ python3 h2o-lightning-4b/prepare.py --check-model
 
 `h2o-lightning-4b/model-release.json` 固定必需文件的官方大小和摘要，包含完整权重 SHA256；准备器流式读取，不反序列化或执行模型代码。缺少新版文件、旧缓存、混用不同 revision 或额外根目录权重会明确失败，且在共享后端升级前检查。HF 快照的同仓库 blobs 相对链接也会保留到只读容器挂载；详细下载、运行合同与未来升级命令见 [H2O 部署说明](h2o-lightning-4b/README.md)。
 
-**部署基于 vLLM Metal，支持 two-way、one-way 与 BOX 的原生补丁路径。** `h2o-lightning-4b/patches/vllm-metal-bidirectional.patch` 固定官方 Metal `v0.32.0` commit `6d6f2c37f8242f1ff1a336534adf6c2d2fe2936d`；准备器先 `git apply --check`，再构建非 editable wheel 到 H2O 私有 overlay，不修改基础安装、共享 `current`，不引入社区 facade 或其他推理框架。shim 默认双向，保留官方启动探针；显式 `causal` 切单向，`type=box` 开启同引擎因果图像定位生成。安全部署关闭整个引擎的 prefix cache/chunked prefill，整段预算40960；one-way 也不复用前缀缓存。模型 BF16 与真正 FP32 head 合同不降低，详细限制见模型 README；真实新版权重验收仍待手动下载。
+**部署基于 vLLM Metal，支持 two-way、one-way 与 BOX 的原生补丁路径。** `h2o-lightning-4b/patches/vllm-metal-bidirectional.patch` 固定官方 Metal `v0.32.0` commit `6d6f2c37f8242f1ff1a336534adf6c2d2fe2936d`；准备器先 `git apply --check`，再构建非 editable wheel 到 H2O 私有 overlay，不修改基础安装、共享 `current`，不引入社区 facade 或其他推理框架。shim 默认双向，保留官方启动探针；显式 `causal` 切单向，`type=box` 开启同引擎因果图像定位生成。安全部署关闭整个引擎的 prefix cache/chunked prefill，整段预算40960；one-way 也不复用前缀缓存。模型 BF16 与真正 FP32 head 合同不降低，详细限制见模型 README。
 
-本次在已安装的 vLLM Metal `0.32.0` wheel 上构建 H2O 私有 non-editable patched wheel；wheel 内容/RECORD、Metal 原生扩展导入、私有 `vllm --help` / `vllm serve --help` 和双向/单向请求模式校验均通过。H2O 官方权重尚未下载，本次未启动或重载服务，因此真实 three-probe、双向/单向推理与 BOX 图像定位质量尚未验证；具体边界见模型 README。
+固定发布已完成文件校验，官方基础后端及私有 patched wheel 已构建验证。真实模型加载暴露的 FP32 head 探针问题已修复：通过模型原生 forward 捕获 head 输入验证投影，不再把需要原生 cache/位置初始化的 backbone 当作独立 split 路径调用。真实 Qwen3.5 FP32 head 加载及6项原生上下文/拒绝路径烟测通过；统一接口和官方 three-probe 的最终状态见模型 README，不以离线检查代替推理验收。
 
 **Two-way：SystemOne choice / noul / score。** `/v1/systemone` 无需提供 `model`，请求使用 `state` 和对象形式的 `questions`。下例询问优先级、是否影响所有客户与紧急程度，显式指定 `attention_mode=bidirectional`；改为 `causal` 即可比较 one-way，省略默认双向。
 

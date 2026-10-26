@@ -135,7 +135,7 @@ def validate_runtime(runtime, provenance):
                 "import vllm_omni_metal",
                 "from vllm_omni_metal.quantization.linear import QuantizedLinear, build_profile, validate_profile, apply_profile",
                 "from vllm_omni_metal.quantization.engine import DynamicEngine",
-                "from vllm_omni_metal.quantization.capture import CaptureSession",
+                "from vllm_omni_metal.quantization.capture import CaptureSession, DiskCaptures",
                 "from vllm_omni_metal.quantization.adapter import DenseModelAdapter",
                 "from vllm_omni_metal.quantization.runtime import load_profile, configure_model_quantization",
                 "backend = distribution('vllm-omni-metal')",

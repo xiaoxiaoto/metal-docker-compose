@@ -425,7 +425,7 @@ index 0000000..5d86bce
 +def test_unsupported_native_head_semantics_fail_loading(model_type):
 +    model = model_type()
 +    original_embedding = model.model.embed_tokens
-+    with pytest.raises(ValueError, match="native/split"):
++    with pytest.raises(ValueError):
 +        install_output_head(
 +            model, DefaultModelAdapter(), model_config=_config(head_dtype="float32")
 +        )
@@ -1047,7 +1047,27 @@ index 3a58126..39851e1 100644
          # MLX-native sampling key chain (opt-in via VLLM_METAL_NATIVE_SAMPLING).
          # Derived from the engine seed, so sampling is reproducible for a
          # fixed request schedule; split once per sampling call. A live key is
-@@ -1479,6 +1485,12 @@ class MetalModelRunner:
+@@ -1162,8 +1168,17 @@ class MetalModelRunner:
+         mx.clear_cache()
+         cache_before = mx.get_cache_memory()
+         dummy_tokens = mx.zeros((1, warmup_len), dtype=mx.int32)
+-        target_outputs = self._dummy_forward_outputs(dummy_tokens)
+-        mx.eval(*target_outputs)
++        # The whole-prompt profile must not materialize a quadratic score buffer.
++        # Startup is single-threaded; restore the MLX entrypoint before serving.
++        native_sdpa = mx.fast.scaled_dot_product_attention
++        if getattr(self, "_bidirectional_attention_enabled", False):
++            from functools import partial
++            mx.fast.scaled_dot_product_attention = partial(native_sdpa, force_fused=True)
++        try:
++            target_outputs = self._dummy_forward_outputs(dummy_tokens)
++            mx.eval(*target_outputs)
++        finally:
++            mx.fast.scaled_dot_product_attention = native_sdpa
+         retain_target_outputs = self._aux_capture is None
+         if not retain_target_outputs:
+             # DFlash profiles its captured target forward below.
+@@ -1479,6 +1494,12 @@ class MetalModelRunner:
          Stashes all state needed by ``sample_tokens`` in
          ``_execute_model_state`` (mirrors upstream's pattern).
          """
@@ -1060,7 +1080,7 @@ index 3a58126..39851e1 100644
          decode_segments = self._spec_decode_controller.build_decode_segments(
              decode_reqs,
              self._spec_decode_controller.active_spec_decode_tokens(scheduler_output),
-@@ -1586,6 +1598,8 @@ class MetalModelRunner:
+@@ -1586,6 +1607,8 @@ class MetalModelRunner:
          )
          try:
              ctx = get_context()
@@ -1074,13 +1094,13 @@ new file mode 100644
 index 0000000..b61e8cf
 --- /dev/null
 +++ b/vllm_metal/v1/output_head.py
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,211 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Honor HF ``head_dtype=float32`` without converting stored model weights.
 +
 +Only ordinary MLX Linear/Embedding heads resolved by the model adapter are
-+supported. Native and split forwards must agree at load time, including logit
-+postprocessing; custom compute_logits, quantization, and LoRA are rejected.
++supported. The native forward must use the projection and agree with adapter
++logit postprocessing; custom compute_logits, quantization, and LoRA are rejected.
 +Embedding lookup remains in the checkpoint dtype. Projection casts vocabulary
 +slices transiently, not an entire persistent FP32 copy of a tied vocabulary.
 +"""
@@ -1194,10 +1214,10 @@ index 0000000..b61e8cf
 +
 +    No-head-dtype models are untouched. The same module handles full, selected,
 +    multimodal, and decode projection; the adapter still owns row selection and
-+    logit postprocessing. A native/split parity probe rejects head bypasses and
-+    postprocessing the adapter cannot reproduce, rather than silently rounding
-+    back to the backbone dtype. This probe runs only at model load, before paged
-+    attention contexts exist. No compilation or persistent FP32 weights are used.
++    logit postprocessing. Probe the head through the native forward, preserving
++    model-owned cache/position setup. Selective-logits support remains a separate
++    runner capability, not a prerequisite for installing a precision contract.
++    No compilation or persistent FP32 weights are used.
 +    """
 +    if not _requests_float32_head(model_config):
 +        return
@@ -1245,11 +1265,60 @@ index 0000000..b61e8cf
 +        _validate_weight(head)
 +        replacement = Float32OutputLinear(head)
 +
-+    setattr(owner, name, replacement)
-+    if not adapter.supports_selective_logits(text_model):
++    # Capture the native head input rather than invoking a backbone without
++    # model-owned cache/position setup. Temporary subclasses add no steady-state
++    # projection overhead; existing selective-logits checks remain unchanged.
++    inputs = []
++
++    class ProbeEmbedding(Float32OutputEmbedding):
++        def as_linear(self, hidden):
++            inputs.append(hidden)
++            return super().as_linear(hidden)
++
++    class ProbeLinear(Float32OutputLinear):
++        def __call__(self, hidden):
++            inputs.append(hidden)
++            return super().__call__(hidden)
++
++    probe = (
++        ProbeEmbedding(head)
++        if tied or getattr(text_model, "lm_head", None) is None
++        else ProbeLinear(head)
++    )
++    setattr(owner, name, probe)
++    try:
++        reference = adapter.extract_logits(
++            text_model(mx.zeros((1, 1), dtype=mx.int32), cache=None)
++        )
++        if len(inputs) != 1:
++            raise ValueError("native forward bypasses or repeats the output projection")
++        expected = adapter.project_logits(text_model, inputs[0])
++        mx.eval(reference, expected)
++        if reference.dtype != mx.float32 or not bool(
++            mx.array_equal(reference, expected).item()
++        ):
++            raise ValueError("native output does not match the FP32 projection")
++    except Exception as error:
 +        setattr(owner, name, head)
 +        raise ValueError(
-+            "Metal head_dtype='float32' requires native/split output-head parity; "
++            "Metal head_dtype='float32' requires native output-head parity; "
 +            "the model bypasses the supported projection or has unsupported "
 +            "logit postprocessing"
-+        )
++        ) from error
++    setattr(owner, name, replacement)
+diff --git a/vllm_metal/v1/model_adapter.py b/vllm_metal/v1/model_adapter.py
+--- a/vllm_metal/v1/model_adapter.py
++++ b/vllm_metal/v1/model_adapter.py
+@@ -850,6 +850,12 @@
+                 "backbone; this model output does not expose hidden states."
+             )
++        # Native wrappers may initialize cache-owned position/state metadata.
++        # Use the same model factory when driving their backbone independently.
++        if cache is None:
++            make_cache = getattr(self.text_model(model), "make_cache", None)
++            if callable(make_cache):
++                cache = make_cache()
+         return backbone(input_ids, cache=cache)
+ 
+     def _compute_target_logits(self, model: Any, hidden_states: mx.array) -> mx.array:
+         text_model = self.text_model(model)

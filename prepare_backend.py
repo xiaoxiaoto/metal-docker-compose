@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from urllib.request import getproxies
 
 from check_versions import EXPECTED
 
@@ -26,6 +27,15 @@ SERVICES = {
     "qwenimage": "com.local.qwen-image-2.1-turbo-metal",
     "seedvr2": "com.local.seedvr2-metal",
 }
+
+
+def inherit_system_proxies():
+    """Pass macOS proxy settings to Git/pip/uv without overriding explicit env."""
+    proxies = getproxies()
+    for scheme in ("http", "https", "no"):
+        key = f"{scheme}_proxy"
+        if key not in os.environ and key.upper() not in os.environ and proxies.get(scheme):
+            os.environ[key] = proxies[scheme]
 
 
 def run(*command, **kwargs):
@@ -141,6 +151,7 @@ def validate(runtime):
 def prepare():
     if not (SOURCE / "install.sh").is_file():
         raise ValueError(f"缺少用户指定的后端源码仓库：{SOURCE}")
+    inherit_system_proxies()
     CACHE.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (CACHE / ".prepare.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
