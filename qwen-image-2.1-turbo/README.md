@@ -8,7 +8,7 @@ Apple Silicon 上运行上游原生 **QwenImage21Pipeline**，复用共享隔离
 - 对外 ID：**`qwen-image-2.1-turbo`**。下载仓库为 `Qwen/Qwen-Image-2.1-Turbo`，不把普通 Qwen-Image 示例中的模型名或 50 步参数照搬到本模型。
 - 单 generation pipeline，从 `model_index.json` 解析组件与采样；无需双阶段 Omni profile，不增加无需求的 `metal-deploy.yaml`。
 
-根目录将本模型配置为 **dynamic，空闲300秒卸载**，详见[通用生命周期](../README.md#通用模型生命周期)。根目录 `./start.sh qwenimage` 在缺少 plist 时自动调用本目录 `start.sh --prepare-only` 准备软件、私有 runtime、权重和 plist；已有 plist 则校验复用，不隐式修复、更新或加载模型。首次推理才离线加载，不改变已有精度和量化策略，外部已运行服务不被接管。
+根目录将本模型配置为 **dynamic，空闲300秒卸载**。每次根目录启动（包括默认/gateway/lifecycle）先安全停止所有依赖模型、删除历史共享环境和私有 overlay，再重建共享后端；停止失败不删除，构建失败不回退。`./start.sh qwenimage` 每次调用本目录 `start.sh --prepare-only` 重建私有环境和 plist，首次推理才离线加载。权重、下载缓存、量化资产和日志保留；精度/量化参数以本次设置为准。详见[根目录重建合同](../README.md#每次根目录启动前重建共享环境)。
 
 冷模型不在聚合列表，单模型身份查询返回503且不唤醒；先查看根目录 `python3 -I lifecycle_control.py status`，发送下文真实文生图curl，完成后复查身份。冷请求另留最多600秒加载预算；不要旁路8099推理。动态启动额外要求至少36GiB保守空闲内存，不能为了常驻H2O而提高MPS水位或放宽门槛。
 
@@ -67,7 +67,7 @@ Apple Silicon、macOS 15+、Python 3.9+（模型准备脚本）、ModelScope CLI
 
 可单独执行 `./qwen-image-2.1-turbo/start.sh --prepare-only`：复用完整准备流程，在原子写入 plist 并通过 `plutil -lint` 后退出，不 bootstrap 或停止已有 worker。已注册任务和端口冲突仍拒绝，非法参数非零退出。无参数直接运行本目录 `start.sh` 仍准备并加载模型；无需先加载再停止来准备动态部署。
 
-先确认大权重下载、磁盘与内存预算，不为验证单模型启动 `all`。共享后端预检发现版本/源码变化时会停止本项目其他模型并构建新环境，失败不激活；只重启所选目标。直接运行本目录 `start.sh` / `stop.sh` 只管理该模型，不操作网关。
+先确认大权重下载、磁盘与内存预算，不为单模型验证启动 `all`。未提供 `VLLM_BACKEND_PYTHON` 时，本目录启动脚本也调用共享准备器，安全停用全部依赖模型、删除历史环境后重建；只恢复所选目标。`stop.sh` 仍只停止本模型，不操作网关。
 
 服务绑定 `127.0.0.1:8099`，label 为 `com.local.qwen-image-2.1-turbo-metal`。plist 在 `~/Library/Application Support/qwen-image-2.1-turbo/` 原子写入，不是登录自启项。保持 spawn、离线加载、600 秒启动等待、不自动重启失败进程；已注册任务/被占用端口明确报错，不杀其他进程，失败只卸载本次启动任务。
 

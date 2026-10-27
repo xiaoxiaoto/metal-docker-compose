@@ -24,11 +24,9 @@ done
 docker info >/dev/null
 docker compose config --quiet
 python3 -I ./lifecycle_control.py validate
-if [ "$target" != gateway ] && [ "$target" != lifecycle ] && \
-    [ "$(python3 -I ./lifecycle_control.py mode "$target")" = resident ]; then
-  backend="$(python3 ./prepare_backend.py)"
-  export VLLM_BACKEND_PYTHON="$backend/bin/python"
-fi
+# Every explicit root start rebuilds the shared backend, including gateway/lifecycle.
+backend="$(python3 ./prepare_backend.py)"
+export VLLM_BACKEND_PYTHON="$backend/bin/python"
 python3 -I ./lifecycle_control.py start
 if [ "$target" = lifecycle ]; then
   python3 -I ./lifecycle_control.py status
@@ -53,7 +51,7 @@ echo "总代理已启动：http://127.0.0.1/v1/。"
 models=()
 dynamic_models=()
 start_model() {
-  local name="$1" directory label model port plist
+  local name="$1" directory label model port
   case "$name" in
     h2o)
       directory=h2o-lightning-4b; label=com.local.h2o-lightning-vllm
@@ -78,17 +76,10 @@ start_model() {
       model=seedvr2; port=8100 ;;
   esac
   if [ "$(python3 -I ./lifecycle_control.py mode "$model")" = dynamic ]; then
-    plist="$HOME/Library/Application Support/$directory/$label.plist"
-    # Invalid existing deployments must fail validation, not be silently replaced.
-    if [ ! -e "$plist" ] && [ ! -L "$plist" ]; then
-      echo "$name 尚未部署，自动准备后端、模型权重和启动配置；完成后保持冷状态。"
-      if [ -z "${VLLM_BACKEND_PYTHON:-}" ]; then
-        echo "共享后端若需升级会停止受影响模型；不绕过在途请求保护。"
-        backend="$(python3 ./prepare_backend.py)"
-        export VLLM_BACKEND_PYTHON="$backend/bin/python"
-      fi
-      "./$directory/start.sh" --prepare-only
-    fi
+    # Every explicit model start rebuilds the backend and its dependent overlays.
+    # Regenerate the selected deployment before validating its cold-start contract.
+    echo "$name 重新准备模型私有环境和启动配置；完成后保持冷状态。"
+    "./$directory/start.sh" --prepare-only
     python3 -I ./lifecycle_control.py check-dynamic "$model"
     dynamic_models+=("$model")
     echo "$name 已配置 dynamic；首次推理加载，模型列表查询不唤醒。"

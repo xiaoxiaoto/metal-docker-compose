@@ -3,7 +3,7 @@
 Apple Silicon 本机使用 **vllm-omni + vllm-omni-metal**，执行上游原生 **Talker → Code2Wav** 双阶段。本目录不再运行 Docker 代理；统一入口由根目录总代理提供，不在 Linux 容器中加载 Metal 模型。
 
 不再使用旧 `higgs_metal`、mlx-audio 融合适配器或自建 HTTP server；接口、模型采样和 codec 由上游 Omni 提供。
-根目录现将本模型配置为 **dynamic，空闲300秒卸载**。通用配置和状态见[根目录生命周期说明](../README.md#通用模型生命周期)。根目录 `./start.sh higgs` 在缺少 plist 时自动调用本目录 `./start.sh --prepare-only`，完成环境、模型和 plist 准备；已有 plist 则校验后复用，不覆盖其精度或量化策略。两种情况都不加载真实模型，首次推理才触发离线加载，无需先手动启动再停止。管理器不接管已经手动启动的服务。
+根目录将本模型配置为 **dynamic，空闲300秒卸载**。每次根目录启动（包括默认/gateway/lifecycle）先安全停止所有依赖模型、删除历史共享环境和私有 overlay，再重建共享后端；停止失败不删除，构建失败不回退。`./start.sh higgs` 每次调用本目录 `./start.sh --prepare-only` 重建私有环境和 plist，首次推理才离线加载。权重、下载缓存、量化资产和日志保留；精度/量化参数以本次设置为准。详见[根目录重建合同](../README.md#每次根目录启动前重建共享环境)。
 
 冷模型不会出现在聚合列表，单模型身份查询返回503且不唤醒；先用根目录 `python3 -I lifecycle_control.py status` 检查登记，再发送下文真实推理curl，完成后复查身份。冷请求在原600秒推理预算之外另留最多600秒加载时间。动态保活只覆盖经总代理的请求，勿旁路直连8095推理。
 
@@ -11,13 +11,13 @@ Apple Silicon 本机使用 **vllm-omni + vllm-omni-metal**，执行上游原生 
 ## 环境
 
 - Apple Silicon macOS 15+、MPS、Homebrew、Python 3.9+（启动准备）、ModelScope CLI。根目录总代理另需 Docker Compose。
-- `start.sh` 使用根目录 `prepare_backend.py` 准备的统一隔离环境作为基础，再构建/复用 Higgs 独占的正常 Omni wheel overlay。总启动先查询官方版本并检查兼容性；显式设置已验证的 `VLLM_BACKEND_PYTHON` 时不调用共享准备器。需要升级时先停止受影响模型，构建新环境后切换；不使用独立 Homebrew HEAD 安装/升级流程。
+- `start.sh` 使用根目录 `prepare_backend.py` 准备的统一隔离环境，再构建 Higgs 独占的正常 Omni wheel overlay。显式设置已验证的 `VLLM_BACKEND_PYTHON` 时子脚本不重复调用共享准备器；否则准备器同样先安全停止依赖模型、删除历史环境并重建。不使用独立 Homebrew HEAD 安装/升级流程。
 - 四个服务共用 vLLM/Metal `0.32.0` 与配套 Omni/Omni Metal `0.32.0.dev0`。Omni Metal 从相邻源码仓库构建非 editable wheel，包含通用输出协议修复；不依赖未发布的远端 Formula，不修改 Homebrew 或本地未提交源码。细节见根目录 `README.md`。
 - `prepare.py` 自动扫描 `~/.cache/modelscope/hub/models/作者/模型/`，只提供完整且未量化的 `higgs_multimodal_qwen3` 缓存。唯一候选自动选择，多个候选编号选择，没有候选时输入 ModelScope 仓库名（如 `bosonai/higgs-audio-v3-tts-4b`），下载 `master` 后重新校验；完整缓存不重新下载。
 - 部署名称取所选模型卡仓库名 `/` 后的完整文本并转为全小写，例如 `bosonai/higgs-audio-v3-tts-4b` → `higgs-audio-v3-tts-4b`；`prepare.py` 依次输出部署名称、目录，供启动和健康检查复用。显式目录有 `.mdl` 时从中读取仓库名，否则沿用 `higgs-audio-v3-tts-4b`。更换模型时须同步根目录路由及身份检查。
 - `HIGGS_MODEL_DIR` 显式指定本地目录时优先使用并校验，不扫描、不下载；无交互 stdin 且需要选择时明确报错。`.mdl` 只解析字符串，不反序列化执行缓存代码。模型路径、索引及所有 safetensors 分片必须完整，量化模型及其他架构不会进入候选列表。
-- 软件准备会从官方 Omni main 和本地通用后端源码构建/复用一致版本组；模型只在准备阶段下载，launchctl 进程离线加载。失败保留缓存、不启动模型。
-- 根目录 `./start.sh higgs` / `all` 仅在需要准备或显式启动时传入已校验的 `VLLM_BACKEND_PYTHON`；已有动态 plist 只校验复用。直接运行本目录脚本也使用同一预检。没有变化时不重装、不升级运行中的环境。
+- 软件准备从官方 Omni main 和本地后端源码构建一致版本组；模型只在准备阶段下载，launchctl 离线加载。构建失败不恢复旧环境，模型缓存保留。
+- 根目录 `./start.sh higgs` / `all` 每次传入本轮重建的 `VLLM_BACKEND_PYTHON`，重新生成所选模型的私有环境和 plist，不再复用旧动态部署。
 - 后端已在 48 GiB Mac 验证；这里不是最低内存承诺。不要同时加载新旧两份服务。
 
 `metal-deploy.yaml` 基于上游 Higgs profile（已核对固定 Omni main，非 XPU 拓扑未变），保留原生 sampling、connector 和 async chunk。两个阶段设置 `max_num_seqs=1`、`CUSTOM` MPS SDPA、同步调度和关闭 prefix caching；Code2Wav 模型专用动态量化适配只存在于 Higgs 私有 Omni wheel。每阶段 `gpu_memory_utilization=0.3`，KV 分配保留系统内存 headroom。
@@ -33,7 +33,7 @@ cd docker-compose/higgs-tts-3
 
 准备模式保留磁盘检查；16GiB可用内存门槛只约束实际模型加载，HTTP冷启动仍执行生命周期资源门禁。
 
-`--prepare-only` 复用无参数启动的依赖检查、模型发现/下载校验、共享与私有环境准备及 plist 生成，在写入并通过 `plutil -lint` 后成功退出，不执行 `launchctl bootstrap`，不加载或先启动再停止所选模型。准备模式仍拒绝已有注册任务和 8095 端口冲突，不接管或停止当前所选服务；共享后端如需升级，仍沿用原流程，可能停止其他受影响的本部署模型，应先确认无在途请求。未知参数、重复参数或多余参数均非零退出。无参数 `./start.sh` 仍按原流程准备并立即加载，以下为显式启动/迁移用法：
+`--prepare-only` 执行依赖检查、模型发现/下载校验、环境准备及 plist 生成，通过 `plutil -lint` 后退出，不执行 `launchctl bootstrap`。本模型的注册任务或 8095 冲突仍拒绝；未提供 `VLLM_BACKEND_PYTHON` 时会调用共享准备器，安全停用全部依赖模型并删除历史环境后重建。未知、重复或多余参数非零退出。无参数仍准备并立即加载：
 
 ```bash
 cd docker-compose/higgs-tts-3
@@ -47,7 +47,7 @@ curl -fsS 'http://127.0.0.1/v1/models?model=higgs-audio-v3-tts-4b'
 
 本机模型监听 `127.0.0.1:8095`，统一入口为根目录 `http://127.0.0.1/v1/`，按请求的 `model` 路由。`start.sh` 拒绝复用已注册的旧任务或杀掉占用端口的其他进程；下次启动生成新的 launchctl plist，直接执行选定安装环境的 `bin/vllm-omni serve --omni`，不依赖源码目录或 shell 的 venv 激活状态。
 
-launchctl label 仍为 `com.local.higgs-tts-3-metal`，配置在 `~/Library/Application Support/higgs-tts-3/`，不是登录自启项。`stop.sh` 只停止该模型任务，不操作总代理或其他模型。统一后端升级可能停止本部署其他受影响模型，但不修改 Homebrew、不停止其他项目；单独 `stop.sh` 的管理范围不变。
+launchctl label 为 `com.local.higgs-tts-3-metal`，配置在 `~/Library/Application Support/higgs-tts-3/`，不是登录自启项。`stop.sh` 只停止本模型。根目录启动或直接调用共享准备器会安全停止全部依赖模型并重建环境；不修改 Homebrew 或其他项目。
 
 Omni `/health` 成功时没有旧服务的 JSON 字段；模型身份通过 `/v1/models` 检查。health 就绪不等于语音生成验收通过。
 

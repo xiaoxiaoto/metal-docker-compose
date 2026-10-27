@@ -37,7 +37,7 @@ python3 h2o-lightning-4b/prepare.py --check-model
 - 为保证双向语义，显式启用 `--additional-config '{\"bidirectional_attention\":true}'`，整个引擎关闭 prefix caching 与 chunked prefill，使用 `mamba-cache-mode=none`，40960 上下文与同等整段 batch token 预算。**取舍是 one-way 也不复用前缀缓存**；不声称实现官方 CUDA fork 的请求级缓存优化。双向仅允许单 token 读出，不用于自回归生成；量化 KV、speculative、PP/TP/DP、KV transfer 等未支持组合明确拒绝，不静默回退。
 - 保留官方配置：题型温度 `choice=0.75`、`noul=0.8`、`score=0.65`，真假概率 floor `0.801`，图像温度 `0.65`；模型权重和 embedding lookup 保持 BF16，补丁按 `head_dtype=float32` 实施真正 FP32 输出投影，不是 BF16 计算后转型，不放宽官方 three-probe 容差。
 - BOX 通过 `LIGHTNING_BOX_ENABLED=1` 开启，保留官方 `generate`、`generation` 置信度校准与 `presence` 设置；Compose 镜像增加固定 Pillow `13.0.0`，以支持官方绘框路径。保留每次最多4张图、每张1048576像素、`max-logprobs=128`、4并发和 `gpu-memory-utilization=0.55`。这些不是官方 H100 性能或基准结果的复现。
-- `prepare.py` 先离线校验手动下载的模型；通过后才按现有流程校验共享后端，再调用 `prepare_runtime.py` 构建私有补丁 wheel。缺权重时不会下载、升级后端或启服务；实际共享版本以根目录 README 和 `check_versions.py` 为准。
+- 根目录 `./start.sh h2o` 每次离线校验权重后重建共享环境：安全停止生命周期管理器及全部依赖模型，删除历史共享环境和私有 overlay，再安装验证共享后端，随后构建 H2O 私有补丁 wheel 并加载。停止失败不删除；构建失败不回退旧环境。权重、下载缓存、量化资产和日志保留。缺权重时不重建、不启服务；详见[根目录重建合同](../README.md#每次根目录启动前重建共享环境)。
 - 共享后端准备阶段会继承 macOS 系统 HTTP/HTTPS 代理，显式环境变量优先，保留 TLS 校验；无需在代码里填写代理端口。代理程序须已运行。首次后端安装完成前网关可能尚未监听，应等待 `./start.sh h2o` 最终成功，再执行下方身份检查与真实推理 curl。
 - vLLM 由 `com.local.h2o-lightning-vllm` 管理，plist 位于 `~/Library/Application Support/h2o-lightning-shim/`，日志为 `~/Library/Logs/h2o-lightning-vllm.log` 和 `.error.log`。保持离线加载、`spawn`、有限等待和失败时只清理本次启动服务。已注册但不健康、配置不匹配或端口被其他进程占用时拒绝接管，不自动杀进程或覆盖运行配置。
 - H2O 是根目录 `model-lifecycle.json` 中的 `resident`：不自动加载或空闲卸载。`/v1/systemone` 与精确 `/v1/decisions` 经生命周期代理转到 shim；后者必须通过 model 校验。`/v1/chat/completions`、`/v1/completions`、单模型 `/v1/models` 仍到 vLLM，不经过 shim 的提示构造、概率校准与类型转换。
@@ -48,15 +48,13 @@ python3 h2o-lightning-4b/prepare.py --check-model
 
 wheel 构建后逐文件比对归档与固定源码副本（包含 native resources），安装后校验私有模块路径、源码摘要、RECORD 与原生扩展加载；私有 `bin/vllm` launcher 指向该 overlay 的 Python。每次复用都重新检查版本、`pip check` 和加载，只有全部通过才发布 `.ready`。指纹覆盖固定基线、补丁、准备器、基础发行资源和解释器；不会修改已安装基础包、Homebrew、共享 `current` 或其他模型的 overlay；请求期间不下载、不打补丁、不编译。缺补丁、基线不匹配、依赖冲突或资源损坏均明确失败。
 
-停止或重载会中断在途请求。此次只更新 H2O 私有 overlay 与启动时生成的 launchd 配置，不修改 Nginx 路由或生命周期配置；无需重启 gateway/lifecycle。已启动旧 plist 时，新配置需按下列步骤加载。先在项目根目录确认无在途请求：
+根目录启动现在统一负责安全排空、停用依赖模型、删除历史环境并重建，不需要手动先停 H2O。重建期间统一入口不可用，构建失败不会回退旧环境；在根目录执行：
 
 ```bash
-./stop.sh h2o
-./stop.sh lifecycle
 ./start.sh h2o
 ```
 
-停止 lifecycle 会影响其他模型的统一入口，并回收其持有的空闲动态模型；有在途请求时会拒绝停止。此命令只准备并启动 H2O，不使用 `all`。共享后端若需升级，可能停止其他已注册模型。
+停止 lifecycle 会影响统一入口，有在途请求时拒绝停止。根目录每次启动（包括默认/gateway/lifecycle）都会安全停止所有依赖模型并删除历史环境重建；单目标只恢复 H2O，其余模型不自动恢复。不要连续执行多个根目录启动命令并期待前一个模型仍运行。
 
 **验证边界：** 私有 wheel/RECORD、模块归属和原生 Metal 扩展加载检查不能替代真实推理。FP32 head 使用模型原生 forward 验证实际投影，不要求模型支持缺少原生 cache/位置初始化的独立 backbone 调用；不改变 selective logits 的能力门禁，不放宽官方 three-probe。实际启动与统一入口验收结果记录在末尾。
 
@@ -245,3 +243,4 @@ printf '{"state":{"photo":"data:image/png;base64,%s"},"attention_mode":"causal",
 
 后续启动排障：固定 revision 模型文件已通过完整校验。共享准备器继承系统代理后，官方基础后端与 H2O 私有 wheel 已完成构建、版本、依赖和原生扩展检查，网关已启动。随后真实 Qwen3.5 加载暴露旧 FP32 head 探针错误调用独立 backbone 的 `NoneType.offset`；补丁改为通过原生 forward 捕获 head 输入，并继续验证 FP32 dtype、adapter 投影一致性和绕过/额外缩放拒绝。真实模型 head 安装及 BF16 权重/lookup 保留通过；6项 tied/untied、bias、softcap、原生初始化与拒绝回滚烟测通过。以上不是统一接口或官方 three-probe 结果。
 
+2026-10-26：根目录强制重建流程的7项隔离回归及5项入口场景通过，部署语法/配置检查通过。两次实际根目录H2O启动均完成依赖模型安全停止、历史目标环境删除及新虚拟环境/pip创建，随后uv获取官方vLLM 0.32.0 wheel连接超时，显式系统代理重试仍失败。半成品为 `~/.local/share/local-model-backend/runtime/3c55218aa0633b9f/`，有安装器标记但无 `.ready`，`current` 不存在；本次未激活后端、未启动H2O/shim，也未执行统一入口推理验收。下次仍使用 `./start.sh h2o`，需先确保官方GitHub Release资源下载链路可用；上文历史结果不代表本次通过。

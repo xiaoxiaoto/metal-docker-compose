@@ -1,7 +1,7 @@
 # MOSS-Transcribe-Diarize · vLLM + vLLM Metal
 
 参考 [官方模型卡](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize) 与 `../higgs-tts-3/`。**不使用 vLLM-Omni，不自建 HTTP server。**
-根目录将本模型配置为 **dynamic，空闲300秒卸载**，详见[通用生命周期](../README.md#通用模型生命周期)。根目录 `./start.sh moss` 在缺少 plist 时自动调用本目录 `./start.sh --prepare-only`，完成环境、模型和 plist 准备；已有 plist 则校验后复用，不改写模型精度。两种情况都不加载模型，首次推理才触发离线加载，无需先手动启动再停止。已手动运行的服务不会被管理器接管或停止。
+根目录将本模型配置为 **dynamic，空闲300秒卸载**。每次根目录启动（包括默认/gateway/lifecycle）先安全停止所有依赖模型、删除历史共享环境和私有 overlay，再重建共享后端；停止失败不删除，构建失败不回退。`./start.sh moss` 每次调用本目录 `./start.sh --prepare-only` 重建私有环境和 plist，首次推理才离线加载。权重、下载缓存及日志保留；参数以本次设置为准。详见[根目录重建合同](../README.md#每次根目录启动前重建共享环境)。
 
 冷模型不在聚合模型列表中，单模型身份查询返回503且不唤醒；先查看根目录 `python3 -I lifecycle_control.py status`，发送下文真实转写curl，推理完成后复查身份。冷请求另留最多600秒启动预算；不要旁路8097推理，否则无法获得请求保活保证。
 
@@ -29,7 +29,7 @@ cd docker-compose/moss-transcribe-diarize
 ./start.sh --prepare-only
 ```
 
-`--prepare-only` 完整复用依赖检查、共享与私有环境准备、版本检查、模型下载/验证和 plist 生成，写入并通过 `plutil -lint` 后成功退出，不执行 `launchctl bootstrap`，不加载或先启动再停止所选模型。准备模式仍拒绝已有注册任务和 8097 端口冲突，不接管或停止当前所选服务；共享后端如需升级，仍沿用原流程，可能停止其他受影响的本部署模型，应先确认无在途请求。未知参数、重复参数或多余参数均非零退出。无参数行为不变，仍准备后立即加载：
+`--prepare-only` 执行依赖检查、环境准备、版本检查、模型下载/验证和 plist 生成，通过 `plutil -lint` 后退出，不 bootstrap 或加载模型。已有任务或 8097 冲突仍拒绝；未提供 `VLLM_BACKEND_PYTHON` 时会调用共享准备器，安全停用全部依赖模型并删除历史环境后重建。非法参数非零退出；无参数仍准备后立即加载：
 
 ```bash
 cd docker-compose/moss-transcribe-diarize
@@ -41,7 +41,7 @@ curl -fsS 'http://127.0.0.1/v1/models?model=moss-transcribe-diarize'
 ```
 
 - 模型在 macOS launchctl 中监听 `127.0.0.1:8097`；统一入口由根目录总代理提供：`http://127.0.0.1/v1/`，按 `model` 分流。本目录不再包含 Docker/Nginx 代理。Linux 容器不能使用 Apple Metal。
-- 根目录 dynamic 入口缺少 plist 时先准备后登记，已有 plist 只校验复用；不会立即加载模型。直接无参数运行本目录脚本仍先查询官方最新版本、升级并校验统一后端，再加载模型。四服务共用 vLLM/Metal `0.31.0` 与配套 Omni/Omni Metal 开发版，详见根目录 `README.md`；MOSS 请求仍只使用 vLLM STT，不进入 Omni pipeline。
+- 根目录 dynamic 入口每次重建共享后端并重新准备本模型环境/plist，不立即加载模型。直接无参数运行本目录脚本在未提供 `VLLM_BACKEND_PYTHON` 时也调用共享准备器。兼容组以根目录 README 和 `check_versions.py` 为准；MOSS 请求仍只使用 vLLM STT，不进入 Omni pipeline。
 - 私有环境位于 `~/.local/share/local-model-backend/overlays/moss-transcribe-diarize/<fingerprint>/`，只安装本目录插件，通过 `.pth` 复用 `current` 指向的共享后端；不改 Homebrew 或统一环境的模型实现。共享基础后端位于同一根目录的 `runtime/<fingerprint>/`。
 - 安装校验使用选定私有Python `-I`。MOSS走基础vllm-metal的MLX STT，不使用
   本插件执行层，不要求其量化API；与PaddleOCR/H2O等基础vLLM路由一样，

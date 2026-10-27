@@ -1,7 +1,7 @@
 # SeedVR2 7B FP16 · Omni + Metal
 
 本目录提供 Apple Silicon 单 MPS 的原生 `SeedVR2Pipeline` 部署代码，规范模型 ID 为 `seedvr2`，提供图片超分与短视频修复入口。**本次仅编写代码，未下载真实权重、未安装/激活运行时、未启动服务，也未完成真实权重、图片超分或视频验收。** 健康检查成功不能替代推理验收。
-根目录将本模型配置为 **dynamic，空闲300秒卸载**，详见[通用生命周期](../README.md#通用模型生命周期)。根目录 `./start.sh seedvr2` 在缺少 plist 时自动调用本目录 `start.sh --prepare-only` 准备软件、私有 runtime、权重和 plist；已有 plist 则校验复用，不隐式修复、更新或加载模型。首次实际推理才离线加载，已有外部服务不被接管，FP16 和量化策略不变。准备成功不代表真实推理已验收。
+根目录将本模型配置为 **dynamic，空闲300秒卸载**。每次根目录启动（包括默认/gateway/lifecycle）先安全停止所有依赖模型、删除历史共享环境和私有 overlay，再重建共享后端；停止失败不删除，构建失败不回退。`./start.sh seedvr2` 每次调用本目录 `start.sh --prepare-only` 重建私有环境和 plist，首次推理才离线加载。权重、下载缓存、量化资产和日志保留；FP16/量化参数以本次设置为准，准备成功不等于真实推理通过。详见[根目录重建合同](../README.md#每次根目录启动前重建共享环境)。
 
 冷状态的聚合列表不含本模型，单模型查询返回503且不唤醒；先查看根目录 `python3 -I lifecycle_control.py status`，发送下文真实图片/视频curl，完成后复查身份。冷请求在热推理预算之外另留最多1800秒加载预算；不旁路8100推理。动态启动额外要求至少24GiB保守空闲内存，不提高MPS水位。
 
@@ -32,7 +32,7 @@
 
 `start.sh` 先校验共享 `VLLM_BACKEND_PYTHON` 和资源，再准备私有 runtime 与权重；CLI 使用私有 `overlay/bin/vllm-omni`，但 `VLLM_BACKEND_PYTHON` 仍指向共享基础环境。launchctl label 为 `com.local.seedvr2-metal`，监听 `127.0.0.1:8100`；plist 位于 `~/Library/Application Support/seedvr2/`，日志为 `~/Library/Logs/seedvr2-metal.log` 和 `seedvr2-metal.error.log`。不是登录自启项。
 
-共享后端预检的既有升级流程不变：版本或源码变化可能停止其他受影响模型，应先确认无在途请求。`--prepare-only` 不通过先启动再停止本模型实现准备，也不接管当前所选服务；共享升级的影响与本模型 worker 的准备/加载分离。
+未提供 `VLLM_BACKEND_PYTHON` 时，本目录启动脚本调用共享准备器，联网预检后安全停用全部依赖模型、删除历史环境并重建。`--prepare-only` 本身不 bootstrap 或加载真实模型，不接管已注册的本模型任务；停止失败或残留 worker 会阻止环境删除。
 
 0.32 私有部署的来源指纹包含固定官方 commit、私有版本、补丁、构建器、模型资源及当前后端源码；因此不会复用旧 0.31 overlay 的 `.ready`。复用或新建均检查私有包路径、版本、资源 SHA256 和 wheel RECORD，并运行 `pip check` 后才接受 ready。2026-10-23 已从干净官方源构建并验证修复版 `d330c15663ac65d3`，未修改共享冻结环境或激活服务。图片原精度生成通过不等于 ANE＋DynamicEngine 联合批准；质量 1% 和整模型收益 3% 门槛不变，量化/ANE 默认仍 off。
 

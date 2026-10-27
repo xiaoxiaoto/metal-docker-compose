@@ -7,7 +7,7 @@
 - 规范模型 ID：**`paddleocr-vl`**，不是 `PaddlePaddle/PaddleOCR-VL` 或 `PaddleOCR-VL-0.9B`。下载仓库仍带作者前缀。
 - 后端只监听 `127.0.0.1:8098`；公开调用及验收走统一入口 `http://127.0.0.1/v1/`。
 
-根目录将本模型配置为 **dynamic，空闲300秒卸载**，详见[通用生命周期](../README.md#通用模型生命周期)。根目录 `./start.sh paddleocr` 在缺少 plist 时自动调用本目录 `start.sh --prepare-only` 准备软件、权重和 plist；已有 plist 则校验复用，不隐式修复、更新或加载模型。首次实际推理才离线加载。已有手动服务不被接管，精度和 processor 合同不变。
+根目录将本模型配置为 **dynamic，空闲300秒卸载**。每次根目录启动（包括默认/gateway/lifecycle）先安全停止所有依赖模型、删除历史共享环境和私有 overlay，再重建共享后端；停止失败不删除，构建失败不回退。`./start.sh paddleocr` 每次调用本目录 `start.sh --prepare-only` 重新校验权重并生成 plist，首次推理才离线加载。权重、下载缓存和日志保留；参数以本次设置为准。详见[根目录重建合同](../README.md#每次根目录启动前重建共享环境)。
 
 冷模型不在聚合列表中，单模型身份查询返回503且不唤醒；先在根目录查看 `python3 -I lifecycle_control.py status`，发送下文真实OCR请求，完成后再检查身份。冷请求另留最多600秒加载预算；不直连8098推理，避免绕过保活计数。
 
@@ -30,9 +30,9 @@ cd docker-compose/paddleocr-vl
 ./stop.sh
 ```
 
-直接 `paddleocr-vl/start.sh` / `stop.sh` 只操作本机模型。`--prepare-only` 复用完整准备流程，在原子写入 plist 并通过 `plutil -lint` 后退出，不 bootstrap 或停止已有 worker；已注册任务和端口冲突仍拒绝，非法参数非零退出。根目录 dynamic 启动自动准备缺失 plist，已有 plist 校验复用；只有 resident 路径才在启动最后要求聚合模型列表包含该 ID。health、列表和登记均不能代替识别验收。
+`--prepare-only` 执行完整准备流程，通过 plist 校验后退出，不 bootstrap。已注册任务和端口冲突仍拒绝，非法参数非零退出。根目录每次重新准备本模型部署；只有 resident 路径在启动最后要求聚合列表含指定 ID。health、列表和登记不能代替识别验收。
 
-共享后端预检可能因官方版本/源码变化需要升级，此时会停止本项目其他已注册模型、打断请求；只重新启动所选目标。下载、模型并驻和升级前确认内存/网络预算，勿为验证此模型启动 `all`。已注册任务或被其他进程占用的 8098 明确报错，不自动清理别人进程。等待加载最多 600 秒，失败只卸载本次启动的任务。
+未提供 `VLLM_BACKEND_PYTHON` 时，本目录启动脚本也调用共享准备器，安全停用全部依赖模型、删除历史环境后重建；只恢复所选目标。`stop.sh` 仍只停止本模型。先确认下载、磁盘与内存预算，勿为单模型验证启动 `all`；不终止占用 8098 的其他进程，加载最多等待600秒，失败只卸载本次启动任务。
 
 launchctl label：`com.local.paddleocr-vl-metal`；plist：`~/Library/Application Support/paddleocr-vl/com.local.paddleocr-vl-metal.plist`，不是登录自启项。日志：`~/Library/Logs/paddleocr-vl-metal.log`、`~/Library/Logs/paddleocr-vl-metal.error.log`。
 

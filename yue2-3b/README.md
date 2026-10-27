@@ -3,7 +3,7 @@
 参考 [模型卡](https://huggingface.co/m-a-p/YuE2-3B) 和 `../higgs-tts-3/`。独立端口、服务和缓存，不修改 Higgs / H2O 或通用 Metal 后端。
 
 **源码部署合同（2026-10-22）：量化默认 `off`，仅接受 `off/dynamic`；旧 `manual-w8a16` 启动接口已废除。dynamic 必须使用完整离线搜索批准的私有 profile，且 ANE off。本次源码切换不修改已安装 overlay、ready、plist、用户策略或运行服务；下文旧 W8 测量仅为历史证据，不代表新 dynamic 已通过真实生成验收。**
-根目录现将本模型配置为 **dynamic，空闲300秒卸载**；通用合同见[根目录生命周期说明](../README.md#通用模型生命周期)。根目录 `./start.sh yue2` 在缺少 plist 时自动调用本目录 `./start.sh --prepare-only`，完成环境、模型和 plist 准备；已有 plist 则校验后复用，不改写其中的精度或量化设置。首次推理才离线加载，无需先手动准备、加载再停止。已有手动服务不会被接管或自动停止。
+根目录将本模型配置为 **dynamic，空闲300秒卸载**。每次根目录启动（包括默认/gateway/lifecycle）先安全停止所有依赖模型、删除历史共享环境和私有 overlay，再重建共享后端；停止失败不删除，构建失败不回退。`./start.sh yue2` 每次调用本目录 `./start.sh --prepare-only` 重建私有环境和 plist，首次推理才离线加载。权重、下载缓存、量化资产和日志保留；精度/量化参数以本次设置为准。详见[根目录重建合同](../README.md#每次根目录启动前重建共享环境)。
 
 冷状态的聚合列表不含本模型，单模型身份查询返回503且不唤醒；先在根目录查看 `python3 -I lifecycle_control.py status`，发送下文真实音频请求，完成后再检查身份。首次请求在热推理预算之外另留最多600秒加载时间。动态请求只走统一入口，不直连8096；完整音频/流结束前不会启动空闲计时。
 
@@ -45,7 +45,7 @@ Omni最新main已前移，未借本次修复迁移共享环境。
 ## 原生拓扑和版本
 
 - YuE2 是单阶段 `AR（semantic tokens）→ terminal NAR flow matching → VAE`，不是 Higgs 的 Talker → Code2Wav 双阶段，不能复用其 connector 或 codec 配置。
-- 当前共享环境采用官方 Omni commit `9534efe802ef79ce52af31847fb144f63d259e90`（`0.32.0.dev0+cpu`），配套 vLLM / vllm-metal `0.32.0`；启动已有 dynamic plist 不升级共享环境，重新准备时仍遵循根目录官方版本预检。不要混用历史0.31的 overlay 或桥接模块布局。
+- 共享兼容组为 vLLM / vllm-metal `0.32.0` 与配套 Omni / Omni Metal 开发版，实际 Omni commit 由根目录联网预检决定；每次根目录启动都重建共享环境，私有准备器仍保留自身来源兼容门禁。不要混用历史 overlay 或桥接模块布局。
 - checkpoint 的架构名是 `YuE2ForCausalLM`，profile 用 `hf_overrides.architectures: [Yue2ForCausalLM]` 选择 Omni 原生类，不执行 checkpoint remote code。
 - YuE2 的实际文本 tokenizer 是本地 `qwen.tiktoken`，engine 接收 token IDs 并设置 `skip_tokenizer_init: true`。本 profile 显式用 `tokenizer: null` 覆盖上游无用的 `gpt2` 占位引用，避免 vLLM 在离线模式下仍尝试解析 GPT-2 缓存；不额外下载 GPT-2，也不关闭离线限制。
 - 同时需要未量化 `m-a-p/YuE2-3B`（AR/NAR BF16，约 7.26 GB）和标准 `m-a-p/YuE2-Vae`（FP32，约 0.53 GB）；输出目标是 **48 kHz 双声道**。默认使用 ModelScope 完整下载并保留仓库文件/缓存元数据，不安装仓库内的推理 wheel；显式选择 HF 时只下载模型必需文件。
@@ -98,7 +98,7 @@ cd docker-compose/yue2-3b
 ./start.sh --prepare-only
 ```
 
-准备模式完整复用共享后端与私有 overlay 准备、版本检查、`check_metal.py` 的 tiny MPS 自检、模型下载/验证和 plist 生成，写入并通过 `plutil -lint` 后成功退出，不执行 `launchctl bootstrap`，不加载或先启动再停止真实模型。16GiB available 只在实际 bootstrap 前检查，2GiB磁盘门槛仍保留。已有注册任务或 8096 端口占用时仍拒绝准备，不接管或停止当前所选服务；共享后端如需升级，仍沿用原流程，可能停止其他受影响的本部署模型，应先确认无在途请求。未知参数、重复参数或多余参数均非零退出。无参数行为不变，仍准备后立即加载：
+准备模式执行环境准备、版本检查、`check_metal.py` tiny MPS 自检、模型下载/验证及 plist 生成，通过 `plutil -lint` 后退出，不 bootstrap 或加载真实模型。16GiB available 仅在实际 bootstrap 前检查，2GiB磁盘门槛保留。已有注册任务或 8096 冲突仍拒绝；未提供 `VLLM_BACKEND_PYTHON` 时调用共享准备器，安全停用全部依赖模型并删除历史环境后重建。非法参数非零退出；无参数仍准备后立即加载：
 
 ```bash
 cd docker-compose/yue2-3b
@@ -106,9 +106,9 @@ cd docker-compose/yue2-3b
 ./stop.sh
 ```
 
-`start.sh` 复用根目录共享后端流程：在线校验官方版本与源码指纹，必要时停止已注册的本部署模型、在新隔离环境构建并验证共享后端，再准备 YuE2 私有 patched Omni overlay。不会安装或升级 Homebrew Formula，不依赖 Homebrew libexec。Formula 仅为历史安装方式，不是本部署当前启动路径。
+`start.sh` 未收到 `VLLM_BACKEND_PYTHON` 时调用根目录共享准备器，联网预检后安全停止所有依赖模型、删除历史环境并重建，再准备 YuE2 私有 patched Omni overlay。不修改 Homebrew Formula。
 
-根目录在配置为 resident 时沿用共享后端准备和显式加载；当前 dynamic 在缺少 plist 时自动准备，已有 plist 只校验复用。准备发生在根目录启动阶段，不放进请求期冷启动命令。直接运行本目录脚本仍会调用统一预检，可能构建/切换环境；共享后端切换后需重新准备匹配 overlay 和 plist。
+根目录 `./start.sh yue2` 每次重新准备私有 overlay 和 plist 后保持冷状态，不再复用旧 plist。准备只发生在显式启动阶段；HTTP 冷启动复用本次已准备部署，不下载、不重建环境。
 
 `check_metal.py` 不再依靠源码字符串判断：实际执行上游 MPS 请求 RNG、完整 sampler / 同步读回、同 seed 与合批隔离、帧上限结束、请求清理、非法分数拒绝，以及随机 tiny NAR 和 FP32 MPS VAE 解码/有限值检查；另检查缺少绑定产物时通用 DenseSwiGLU 保留原生 GPU FFN。它不下载或加载真实大权重，也不是听感验收。通过检查或 `/health` 不等于实际歌曲生成成功。
 

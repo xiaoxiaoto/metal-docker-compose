@@ -84,11 +84,11 @@ python3 -I model_lifecycle.py --config /absolute/path/services.json --port 18100
 - 只对经过总代理/生命周期代理的请求提供保活保证。不要直连动态模型端口推理；旁路请求不计数，不能保证不会遇到空闲卸载。
 - 启动命令必须是有界、事务式的启动器：非零退出前清理自己创建的资源，不停止外部服务。命令须在独立120秒事务预算内完成；模型加载就绪由 `startup_timeout` 另行控制。HTTP等待超时不会杀掉正在确认bootstrap结果的启动器；后台收取成功结果后回收自己启动的模型。停止命令最多60秒，管理器退出预算覆盖全部服务的串行回收。
 
-首次使用动态模型，直接执行根目录 `./start.sh <目标>`：缺少 plist 时自动运行共享后端准备、模型私有 runtime 和权重下载/校验，并生成 plist；准备完成后保持冷状态，不先加载再停止模型。已有 plist 只做校验并复用，不自动改写精度或重建损坏的部署；校验失败明确退出。准备阶段可能下载大权重、构建环境；共享后端若需升级，仍会按现有流程停止受影响模型，因此应在无在途请求时执行。HTTP 冷启动只加载准备好的部署，不下载或编译。
+每次执行根目录 `./start.sh [目标]`（包括默认、`gateway` 和 `lifecycle`）都重建共享环境：先联网版本预检，再原子关闭生命周期请求入口并安全停止所有依赖模型，删除历史共享环境和私有 overlay，然后从空目录安装、验证并激活。停止失败或仍有引用环境的进程时拒绝删除；构建失败不回退旧环境，相关模型保持不可用。权重、下载缓存、wheel/量化资产和日志保留。所选动态目标每次重新运行 `--prepare-only` 生成匹配新环境的 plist，保持冷状态；HTTP 冷启动仍只加载已准备部署，不下载或重建。
 
 ```bash
-./start.sh gateway   # 启动轻量管理器并构建网关；重建网关前确认无在途请求
-./start.sh yue2      # 缺少部署时自动准备，已有部署校验复用；不加载权重
+./start.sh gateway   # 停模型、删除历史环境并重建共享后端，然后启动管理器和网关
+./start.sh yue2      # 同样重建共享后端，再准备 YuE2 私有环境和 plist；不加载权重
 python3 -I lifecycle_control.py status
 # 首次实际推理使用下文对应模型的 curl；冷启动需在 --max-time 中另留最多600秒
 ```
@@ -127,17 +127,17 @@ seed42请求均HTTP200，分别39.583秒（含冷启动）/19.883秒，WAV字节
 
 ```bash
 cd docker-compose
-./start.sh          # 默认启动轻量管理器并构建、检查、启动总代理
-./start.sh gateway  # 同上；更新代理配置时使用，先确认可重载
-./start.sh h2o      # 总代理 + H2O 模型与 shim
-./start.sh higgs    # 总代理 + 自动准备并登记动态 Higgs
-./start.sh yue2     # 总代理 + 自动准备并登记动态 YuE2
-./start.sh moss     # 总代理 + 自动准备并登记动态 MOSS
-./start.sh paddleocr # 总代理 + 自动准备并登记动态 PaddleOCR-VL
-./start.sh qwenimage # 总代理 + 自动准备并登记动态 Qwen-Image
-./start.sh seedvr2   # 缺少部署时自动准备 SeedVR2；不加载权重
-./start.sh all      # 部署全部目标：加载 H2O，其余缺少部署时自动准备并保持冷状态
-./start.sh lifecycle # 仅启动轻量管理器，不构建网关或加载模型
+./start.sh          # 默认也先停模型、删历史环境并重建，再启动管理器和总代理
+./start.sh gateway  # 同上；更新代理配置时使用
+./start.sh h2o      # 重建共享环境 + 总代理 + H2O 模型与 shim
+./start.sh higgs    # 重建共享环境 + 总代理 + 准备动态 Higgs
+./start.sh yue2     # 重建共享环境 + 总代理 + 准备动态 YuE2
+./start.sh moss     # 重建共享环境 + 总代理 + 准备动态 MOSS
+./start.sh paddleocr # 重建共享环境 + 总代理 + 准备动态 PaddleOCR-VL
+./start.sh qwenimage # 重建共享环境 + 总代理 + 准备动态 Qwen-Image
+./start.sh seedvr2   # 重建共享环境并准备 SeedVR2；不加载权重
+./start.sh all      # 仅重建一次共享环境，再加载 H2O、准备所有动态目标
+./start.sh lifecycle # 同样重建共享环境，然后仅启动管理器
 ./start.sh --help
 ```
 
@@ -158,21 +158,23 @@ cd docker-compose
 
 Higgs / YuE2 / MOSS 已移除各自的纯 Nginx Compose，不再使用原来的三个对外代理端口。它们的启停脚本不再要求 Docker，也不操作总代理。H2O shim 有业务逻辑，仍由 `h2o-lightning-4b/docker-compose.yml` 管理，映射为 `127.0.0.1:8740:8741`，不占用总代理端口。它的启动/停止脚本仍管理 H2O 模型和 shim。
 
-总代理和模型的生命周期独立。`./start.sh <模型>` 按配置决定：resident沿用显式准备、加载和最终聚合模型列表校验；dynamic缺少plist时调用对应模型的 `start.sh --prepare-only` 完成部署，再校验并确认管理器已运行，不要求冷模型出现在就绪列表。`all` 按原顺序处理各目标，只加载resident项，其余准备后保持冷状态，任一步失败即停止后续目标。六个动态模型的子目录入口均支持 `--prepare-only`；不传该参数仍沿用显式准备并加载的行为。健康、列表或配置登记都不替代真实推理验收。已注册且健康的resident仍跳过重复加载；已注册但不健康明确失败，不自动杀掉。
+每次根目录启动都会先停用所有依赖模型并删除历史共享/私有环境，随后只恢复指定目标；`all` 在同一次共享重建后按原顺序处理全部目标，任一步失败停止后续操作。resident 显式加载并在最后校验聚合列表；dynamic 每次调用子目录 `start.sh --prepare-only` 重建所需私有环境和 plist，不加载权重。仅执行 `gateway` / `lifecycle` 不恢复模型部署，旧 plist 可能引用已删除的私有环境；使用模型前应执行对应目标，或使用 `all` 一次准备全部。HTTP 冷启动、健康、列表和配置登记均不替代真实推理验收。
 
-### 总启动前的版本预检与升级
+### 每次根目录启动前重建共享环境
 
-启动resident模型（包括含resident的 `all`）或为缺少plist的dynamic模型自动准备时，运行 `prepare_backend.py`。仅gateway/lifecycle和已有dynamic部署的登记不准备或升级后端。动态HTTP冷启动直接复用已准备plist；准备/升级只在显式执行启动脚本时进行，不能在模型请求里触发。
+根目录所有有效启动目标均调用 `prepare_backend.py`，不再复用已有 `.ready` 环境；帮助、非法参数和前置检查失败不执行删除。直接调用准备器也执行同一重建合同。HTTP 动态冷启动不调用准备器。
 
-后端准备器通过 Python 标准库读取 macOS 系统 HTTP/HTTPS 代理，并传给 Git、uv 和 pip 子进程；已有同名大小写代理环境变量（包括空值）优先，不硬编码本机端口、不关闭 TLS 校验。代理只作用于准备器及其子进程，不写入模型 launchd 配置。若配置了代理，请确认代理程序正在运行；后端准备完成前，首次 `./start.sh h2o` 尚不会启动网关，此时直接 curl 统一入口会连接失败，不能视为模型推理错误。
+后端准备器读取 macOS 系统 HTTP/HTTPS 代理并传给 Git、uv 和 pip；已有同名大小写代理环境变量（包括空值）优先，不硬编码端口、不关闭 TLS 校验。准备完成前统一入口可能不可用，应等待根目录命令成功后再执行身份检查和真实推理 curl。
 
-1. 从官方 Git 仓库查询 vLLM / vLLM Metal 最新稳定标签和 Omni 最新 `main` commit；网络失败直接中止，不静默跳过。
-2. 校验兼容版本组：vLLM `0.32.0+cpu`、Metal `0.32.0`、官方 Omni main 开发快照 `0.32.0.dev0+cpu`、Omni Metal `0.32.0.dev0`。当前 Omni main 为 `d6db19b41f8c081506468859cd8f3910f77f1e5c`；vLLM/Metal 0.32 要求 Transformers `>=5.16.1,<5.20.0`，旧 Omni 0.31 的 `<5.15` 冲突，因此必须整组升级，不逐包混装。新官方核心超出兼容矩阵时拒绝启动，须先更新 wheel pins / 插件依赖 / 版本校验并重新验证。
-3. 如官方 Omni commit、后端源码、版本组或后端位置变化，先停止本部署已注册的模型，再在 `~/.local/share/local-model-backend/runtime/<fingerprint>/` 构建新隔离环境。YuE2、MOSS、QwenImage 与 SeedVR2 私有 overlay 位于同一根目录的 `overlays/<model>/<fingerprint>/`。失败不激活新环境、不启动模型；旧环境和模型缓存保留，不修改 Homebrew、系统 Python 或其他项目容器。
-4. Omni Metal 从相邻的 `../vllm-omni-metal`（本机为 `/Users/zhaodehua/Documents/vllm-omni-metal`）干净副本构建非 editable wheel，包含本地通用修复和全部 native 源资源；保留未提交源码，不自动提交、推送或覆盖本地改动。准备器、安装脚本、插件源码/native资源均进入指纹。
-5. 安装时显式 `--with-mps-attention`；使用所选环境的 `-I` 新进程验证实际包版本、`pip check`、MPS、非 editable 路径和 Torch-stream launcher 加载，全部通过且指纹未变才写 `.ready` 并激活。已有 ready 复用也会重新检查，失败先撤销 ready、不切换 current；启动/请求期间不编译 Metal/CoreML 图。七个服务使用同一基础后端；YuE2、MOSS、QwenImage 和 SeedVR2 模型适配各自保持私有覆盖，不污染共享环境或 Metal 插件、不覆盖模型 registry。PaddleOCR-VL 只激活 `metal` 插件、不使用 Omni。复用已运行服务时仍校验实际环境，不能跳过版本检查。
+1. 查询官方 vLLM / Metal 最新稳定标签与 Omni main commit，保留兼容版本门禁。当前验证组合为 vLLM/Metal `0.32.0`、Omni/Omni Metal `0.32.0.dev0`；新核心超出矩阵直接失败，不删除旧环境或混装。
+2. 获取共享准备锁，原子 drain 并停止生命周期管理器；有在途、加载或未确认完成的请求时拒绝。随后按逆序执行全部模型停止入口，包括 H2O shim；任一步失败不删除环境。
+3. 核对 launchctl 任务退出、无残留进程引用环境后，仅删除 `~/.local/share/local-model-backend/runtime/<16位指纹>/`、`overlays/<模型>/<16位指纹>/` 和 `current` 链接。拒绝符号链接环境及异常所有权；其他资产、权重、下载缓存和日志保留。
+4. 在当前指纹的空目录运行相邻 `../vllm-omni-metal/install.sh --with-mps-attention`，再从干净源码副本安装非 editable 插件 wheel，不修改源仓库、Homebrew 或系统 Python。
+5. 用选定 Python `-I` 校验实际版本、`pip check`、MPS、非 editable 路径和 Torch-stream launcher；指纹未变且全部通过才写 `.ready` 与 `backend.json` 并原子激活 `current`。失败不恢复已删除环境；下次执行重新删除半成品并从空目录重建。
 
-没发生变化时只做联网预检和依赖校验，不重装、不重复加载。单模型启动如触发全局后端升级，也会停止其他受影响模型；只重新启动指定目标，需要全恢复时使用 `./start.sh all`。直接运行子目录脚本也使用相同预检流程；停止脚本的管理范围不变。
+单目标命令只恢复该目标，其余模型保持停止；动态目标的私有环境和 plist 随准备重新生成，精度/量化参数按本次环境变量与脚本合同选择，不承诺保留旧 plist 的手工设置。需要全部部署时执行一次 `./start.sh all`，不要连续执行多个根目录启动命令并期待前一个模型仍在运行。
+
+2026-10-26 本次强制重建验证：7项隔离回归通过，含重复执行替换已ready环境、停止失败保留环境、构建失败不激活、真实目录删除/资产保留、符号链接拒绝和真实残留子进程保护；默认/gateway/lifecycle及帮助/非法参数5项根入口夹具通过，Shell、Node、Compose与Python AST检查通过。两次真实 `./start.sh h2o` 均完成安全停止、清理目标环境和新建Python/pip，随后因uv下载官方vLLM wheel连接超时退出，显式系统代理重试也失败；未激活current、未启动模型或完成真实推理。下载缓存可复用不等于复用旧虚拟环境。
 
 共享后端及模型私有适配运行时统一置于无空格目录 `~/.local/share/local-model-backend/`：基础环境在 `runtime/<fingerprint>/`，YuE2、MOSS、QwenImage、SeedVR2 覆盖环境在 `overlays/<model>/<fingerprint>/`。`current` 指向通过验证的共享基础环境，避免 TorchInductor 将带空格的库路径拆成编译参数。迁移通过现有安装流程重新创建环境，不直接移动虚拟环境，也不修改 PyTorch 或关闭编译。旧的 `~/Library/Application Support/local-model-backend/`、`~/Library/Application Support/yue2-3b/runtime/` 和 `~/Library/Application Support/moss-transcribe-diarize/runtime/` 保留、不再使用；模型 plist、工作目录和日志仍位于各自原位置。首次迁移会停止已注册模型并中断在途请求，执行 `./start.sh h2o` 只恢复 H2O；其他目标在下次启动时使用新后端。
 

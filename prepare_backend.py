@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve official versions and prepare one immutable backend for every local model."""
+"""Rebuild the shared backend after safely stopping its dependent local models."""
 
 import fcntl
 import hashlib
@@ -96,16 +96,57 @@ def fingerprint(latest):
 
 
 def stop_models():
+    # Drain the common entry point before stopping any resident/external service.
+    run(sys.executable, "-I", str(PROJECT / "lifecycle_control.py"), "stop")
     domain = f"gui/{os.getuid()}"
-    for name, label in SERVICES.items():
+    for name in reversed(SERVICES):
+        print(f"重建后端，先停止依赖模型：{name}", file=sys.stderr)
+        run("bash", str(PROJECT / "stop.sh"), name)
+    for label in SERVICES.values():
         state = subprocess.run(
             ["launchctl", "print", f"{domain}/{label}"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         if state.returncode == 0:
-            print(f"后端需要升级，先停止受影响的模型：{name}", file=sys.stderr)
-            run("bash", str(PROJECT / "stop.sh"), name)
+            raise ValueError(f"模型任务尚未退出，拒绝删除环境：{label}")
+
+
+def remove_environments():
+    """Delete only fingerprinted environments; never follow cache-directory symlinks."""
+    if CACHE.is_symlink() or CACHE.stat().st_uid != os.getuid():
+        raise ValueError(f"后端根目录路径或所有权无效：{CACHE}")
+    root = CACHE.resolve()
+    candidates = []
+    for category in ("runtime", "overlays"):
+        parent = CACHE / category
+        if parent.is_symlink():
+            raise ValueError(f"环境父目录不能为符号链接：{parent}")
+        if not parent.exists():
+            continue
+        parents = [parent] if category == "runtime" else list(parent.iterdir())
+        for directory in parents:
+            if directory.is_symlink() or not directory.is_dir():
+                raise ValueError(f"环境父目录无效：{directory}")
+            for path in directory.iterdir():
+                if not re.fullmatch(r"[0-9a-f]{16}", path.name):
+                    continue
+                if path.is_symlink() or not path.is_dir() or path.stat().st_uid != os.getuid():
+                    raise ValueError(f"环境路径或所有权无效，拒绝删除：{path}")
+                if not path.resolve().is_relative_to(root):
+                    raise ValueError(f"环境路径越界，拒绝删除：{path}")
+                candidates.append(path)
+    current = CACHE / "current"
+    if current.exists() and not current.is_symlink():
+        raise ValueError(f"current 不是符号链接，拒绝删除：{current}")
+    # A surviving worker must not lose its imported packages underneath it.
+    processes = subprocess.check_output(["ps", "-axo", "pid=,command="], text=True)
+    if any(str(CACHE / category) + "/" in processes for category in ("runtime", "overlays")):
+        raise ValueError("仍有进程引用后端环境，拒绝删除；请检查残留 worker")
+    current.unlink(missing_ok=True)
+    for path in candidates:
+        print(f"删除历史环境：{path}", file=sys.stderr)
+        shutil.rmtree(path)
 
 
 def install_plugin(runtime):
@@ -165,29 +206,25 @@ def prepare():
         runtime = CACHE / "runtime" / key
         ready = runtime / ".ready"
         current = CACHE / "current"
-        complete = ready.is_file() and ready.read_text() == key
-        if not complete or current.resolve() != runtime:
-            stop_models()
-        ready.unlink(missing_ok=True)
-        if not complete:
-            runtime.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            print(f"安装最新兼容后端：{runtime}（不修改 Homebrew 或其他环境）", file=sys.stderr)
-            run(
-                "bash",
-                str(SOURCE / "install.sh"),
-                "--venv",
-                str(runtime),
-                "--with-mps-attention",
-                env=dict(os.environ, VLLM_OMNI_COMMIT=latest["omni_commit"]),
-            )
-            install_plugin(runtime)
+        stop_models()
+        remove_environments()
+        runtime.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        print(f"从空目录重建兼容后端：{runtime}（不修改 Homebrew 或其他环境）", file=sys.stderr)
+        run(
+            "bash",
+            str(SOURCE / "install.sh"),
+            "--venv",
+            str(runtime),
+            "--with-mps-attention",
+            env=dict(os.environ, VLLM_OMNI_COMMIT=latest["omni_commit"]),
+        )
+        install_plugin(runtime)
         validate(runtime)
         if fingerprint(latest) != key:
             raise ValueError("后端源码在构建/校验期间发生变化；未激活该环境，请重试")
-        if not complete:
-            (runtime / "backend.json").write_text(
-                json.dumps(dict(latest, expected=EXPECTED), indent=2) + "\n"
-            )
+        (runtime / "backend.json").write_text(
+            json.dumps(dict(latest, expected=EXPECTED), indent=2) + "\n"
+        )
         ready.write_text(key)
         temporary = CACHE / f".current-{os.getpid()}"
         try:
