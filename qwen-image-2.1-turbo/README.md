@@ -217,7 +217,7 @@ runtime="$("$base" -I prepare_runtime.py)"
 
 已存在证据目录会拒绝覆盖；本机批准文件先在同目录完整写入、fsync，再以原子 no-overwrite
 hard-link 提交，并发发布也不覆盖赢家。可用 `--profile` 指定新文件。
-不需要 `--with-vpipe`，缺 Metal compiler 不应冒充已启用 AOT。若仅安装／验证 overlay，
+不需要 `--with-aot-kernels`，缺 Metal compiler 不应冒充已启用 AOT。若仅安装／验证 overlay，
 准备器会真实构建私有 wheel，不触碰已安装上游；上面的校准另由明确命令执行。
 安装与 pip/check_versions 校验均使用所选解释器 `-I`；后端通过该解释器的 `pip wheel`
 隔离构建，Omni 则由 uv 的隔离构建环境及显式 `--python` 选择解释器。
@@ -297,13 +297,13 @@ VLLM_OMNI_METAL_ANE=auto QWEN_IMAGE_METAL_ANE_LAYERS=0,10,21,31 ./start.sh`。
 
 `patches/qwen-metal.patch` 只为当前原生 QwenImage pipeline 绑定本目录 `metal_adapter.py`：保留官方 registry、组件、采样与 BF16，给已有 FFN/RMSNorm/interleaved RoPE 提供通用算子入口。`prepare_runtime.py` 根据共享官方 Omni commit、私有补丁、适配器和通用后端源码生成指纹，隔离构建非 editable wheel；构建依赖只进入临时构建环境，不把更高版本 setuptools 装进运行时。校验失败不写 `.ready`，不修改共享基础环境。
 
-通用后端源码已按功能分包：diffusion 算子为 `vllm_omni_metal.diffusion.ops`，GPU 构建入口位于 `vllm_omni_metal.ops.vpipe_kernels`，ANE 运行时为 `vllm_omni_metal.ane.runtime`。准备器、安装检查与 ready 校验使用新路径，源码／资源指纹递归包含全部子包。本次仅同步源码，不代表当前运行服务或已安装环境已迁移；没有运行准备器、切换 ready／current、重启服务或启用量化／ANE。
+通用后端源码已按功能分包：diffusion 算子为 `vllm_omni_metal.diffusion.ops`，GPU 构建入口位于 `vllm_omni_metal.ops.aot_kernels`，ANE 运行时为 `vllm_omni_metal.ane.runtime`。准备器、安装检查与 ready 校验使用新路径，源码／资源指纹递归包含全部子包。外部适配器须同步更新 import，重新安装并显式重建；不提供旧模块或 CLI alias/shim。新缓存使用 `aot/elementwise` 和 `aot/diffusion` namespace，旧缓存保留但不复用、不搬移冒充新身份。本次仅同步源码和调用者，不是新算子或性能收益，也不代表当前运行服务或已安装环境已迁移；没有运行 `prepare_backend.py` 或其他准备器、切换 ready／current、重启服务、修改 topology/model policy、启用量化／ANE或发布远端。
 
 | 路径 | 接入方式与限制 |
 |---|---|
 | diffusion attention | `MetalSDPABackend` → Torch MPS SDPA；不是 AR paged-attention |
 | RMSNorm | 保留 Diffusers FP32 variance 和按 weight dtype 决定 cast 的合同，匹配时用 Torch MPS fused norm |
-| SwiGLU | gate/up 独立输入，无额外大 `cat`；已有 vpipe AOT 优先，否则大输入可用现有 MLX bridge |
+| SwiGLU | gate/up 独立输入，无额外大 `cat`；匹配的通用 elementwise AOT 优先，否则大输入可用现有 MLX bridge |
 | RoPE | MPS实际分支调用`mps_rotary`尝试独立diffusion AOT；off、缺产物或布局不支持时保留原实数Torch后备；不误用NeoX表，CPU/CUDA分支不变 |
 | GPU＋ANE gate | 通用 `ane.projection.DenseProjection` 分配256行 chunk；down 不变或由 GPU DynamicEngine 执行，256 MiB/4 GiB 与 live 完整投影双1%门禁不变 |
 | 不相符的原生 AR 优化 | AR 分页 KV、NeoX 缓存表、add-before-RMSNorm 不直接套到 diffusion 条件前缀 KV／interleaved RoPE／LayerNorm |
@@ -315,10 +315,10 @@ VLLM_OMNI_METAL_ANE=auto QWEN_IMAGE_METAL_ANE_LAYERS=0,10,21,31 ./start.sh`。
 ```bash
 # 从根目录运行；先确认共享构建不会中断其他模型。
 backend="$(python3 prepare_backend.py)" &&
-"$backend/bin/python" qwen-image-2.1-turbo/prepare_runtime.py --with-vpipe
+"$backend/bin/python" qwen-image-2.1-turbo/prepare_runtime.py --with-aot-kernels
 ```
 
-`--with-vpipe` 同时准备原 vpipe kernels 和 diffusion interleaved RoPE，普通启动不编译。现已安装 Xcode 27.1（27A9275）和官方 Metal Toolchain 27A266a，`metal`／`metallib` 路径、版本、初始化及实际 `.metal → .air → .metallib` 编译链接验证通过。工具安装说明见 [Apple 官方文档](https://developer.apple.com/documentation/xcode/downloading-and-installing-additional-xcode-components)。
+`--with-aot-kernels` 同时准备通用 elementwise kernels 和 diffusion interleaved RoPE，普通启动不编译；新安装校验定位 `_native/elementwise.metal`、`_native/diffusion_rotary.metal` 和 `_native/THIRD_PARTY_NOTICES.md`。现已安装 Xcode 27.1（27A9275）和官方 Metal Toolchain 27A266a，`metal`／`metallib` 路径、版本、初始化及实际 `.metal → .air → .metallib` 编译链接验证通过；这些既有工具链记录不是通用命名迁移后的产物验收。工具安装说明见 [Apple 官方文档](https://developer.apple.com/documentation/xcode/downloading-and-installing-additional-xcode-components)。
 
 完整真实生成校准需事先释放资源；停止模型会中断在途请求，不能为了校准启动 `all`。启动前至少 32 GiB available，运行中至少 4 GiB available、进程树 RSS 不超过42 GiB、磁盘保留2 GiB；达到停止线只清理本次校准进程，不停止其他应用、不提高 MPS 水位。校准使用固定提示、seed42、512×512、官方8步；每路独立 warmup，正式样本正反交错，包含 encoder→DiT→VAE→CPU 图片返回，不计模型加载或 PNG 保存。离线引擎通过 `OmniDiffusionConfig.enrich_config()` 从官方 `model_index.json` 解析原生 pipeline 类名，与服务端原生类解析一致，不在通用后端硬编码模型名。无真实输出、命中计数、同模式复现、最终 FFN／整图误差证据时不能批准。
 
@@ -345,7 +345,7 @@ ANE FP16 为显式近似计算，不是透明 BF16 等价替换。当前 gate-on
 
 未构建AOT时的历史真实GPU A/B（512×512、seed42、8步；Omni main `082eaf235cfc373322bc5f8a1a3398915446a82d`）：GPU off 27.246／27.823秒，GPU auto 28.695／28.355秒；输出SHA相同、像素误差为0，但auto慢约3.6%，故保持GPU off。当时`aot_silu=false`、`aot_rotary=false`。第0层ANE协同实际执行8次调用、16个ANE chunk；整图相对L2 **0.6697%**，scaled max **12.94%**，超过1%门禁，未批准／发布profile。此前统一入口512×512文生图返回HTTP 200、PNG/RGBA、1,049,508字节，结果`/tmp/qwen-image-test.png`。历史证据：`outputs/qwenimage-gpu-ab-20261016-run6/`、`outputs/qwenimage-ane-20261016-run2/`。
 
-工具链安装后，使用原overlay `bf033dac54505e3e` 的 `python -B -I`，直接调用已安装后端的 `build_vpipe_kernels()` 与 `build_diffusion_kernels()`，未更新共享版本。生产产物位于 `~/.cache/vllm-omni-metal/vpipe/d468e9a681021194bd360ae1fea15e2eef2f64d5ded5537f6bd818973e71ce22/` 和 `~/.cache/vllm-omni-metal/diffusion/e759c87b8abeed212590b5639a03ba625c83753baacdccf7c3a06f82fd1829aa/`。实际metallib的FP32/FP16/BF16独立输入SwiGLU与批量interleaved RoPE数值烟测通过，分别3次`aot`命中；与CPU参考的scaled max均低于1%，BF16本次小张量两算子差异均为0。
+历史工具链安装后，使用原overlay `bf033dac54505e3e` 的 `python -B -I`，直接调用当时已安装后端的 elementwise 与 diffusion 构建函数，未更新共享版本。历史生产产物位于 `~/.cache/vllm-omni-metal/vpipe/d468e9a681021194bd360ae1fea15e2eef2f64d5ded5537f6bd818973e71ce22/` 和 `~/.cache/vllm-omni-metal/diffusion/e759c87b8abeed212590b5639a03ba625c83753baacdccf7c3a06f82fd1829aa/`；这是旧命名的证据位置，不是当前构建或可复用缓存。当前函数为 `build_elementwise_kernels()` 与 `build_diffusion_kernels()`，须以新入口显式重建。历史实际metallib的FP32/FP16/BF16独立输入SwiGLU与批量interleaved RoPE数值烟测通过，分别3次`aot`命中；与CPU参考的scaled max均低于1%，BF16当次小张量两算子差异均为0。
 
 释放Docker Desktop资源后，available达到32.04GiB，完整AOT GPU A/B通过（相同overlay、512×512、seed42、8步；每路独立预热，正式off→auto→auto→off）：off为27.315443／27.215885秒，auto为27.211619／27.036432秒。中位延迟约降低0.52%，每路只有两个正式样本，不据此认定稳定提速或修改默认off。所有样本SHA一致、像素误差为0；候选每图实际命中256次`silu_mul:aot`，512次`rms_norm:torch`，未记录RoPE命中，不能将RoPE产物存在当成整图接入证明。实际生成512×512 RGBA窗台橘猫，目视符合提示。守护器returncode=0、无停止原因，最低available约7.91GiB，engine正常关闭。证据保留在相邻源码仓库`outputs/qwenimage-aot-gpu-ab-20261016-run1/`，包括环境、样本、图片、对照、守护器和关闭记录。本次为离线生成，不是统一HTTP接口验收，也未重跑ANE、2K或编辑。
 

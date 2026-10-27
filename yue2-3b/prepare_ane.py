@@ -216,7 +216,7 @@ class AnePreparation:
 
         import torch
 
-        from vllm_omni_metal.ops import mps_attention, vpipe_kernels
+        from vllm_omni_metal.ops import mps_attention, aot_kernels
 
         model = self.get_model()
         config = model.vllm_config
@@ -247,8 +247,8 @@ class AnePreparation:
                 "attention_implementations": implementations,
                 "torch_stream_attention_available": mps_attention.get_mps_ops() is not None,
                 "torch_stream_launcher": artifact(mps_attention._artifact_path()),
-                "vpipe": {
-                    str(dtype): artifact(vpipe_kernels._artifact_path(dtype))
+                "elementwise": {
+                    str(dtype): artifact(aot_kernels._artifact_path(dtype))
                     for dtype in (torch.float32, torch.float16, torch.bfloat16)
                 },
                 "custom_ops": config.compilation_config.custom_ops,

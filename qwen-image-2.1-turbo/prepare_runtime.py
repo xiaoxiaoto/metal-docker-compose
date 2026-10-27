@@ -140,7 +140,7 @@ def fingerprint(commit, base_site, manifest):
     return digest.hexdigest()[:16]
 
 
-def prepare(with_vpipe=False):
+def prepare(with_aot_kernels=False):
     run(sys.executable, "-I", str(ROOT.parent / "check_versions.py"), "--omni")
     source = json.loads(distribution("vllm-omni").read_text("direct_url.json"))
     if source.get("url") != "https://github.com/vllm-project/vllm-omni.git":
@@ -277,12 +277,12 @@ def prepare(with_vpipe=False):
         ),
     )
     validate_backend(python, manifest)
-    if with_vpipe:
+    if with_aot_kernels:
         run(
             str(python),
             "-I",
             "-c",
-            "from vllm_omni_metal.ops.vpipe_kernels import build_vpipe_kernels,build_diffusion_kernels; build_vpipe_kernels(); build_diffusion_kernels()",
+            "from vllm_omni_metal.ops.aot_kernels import build_elementwise_kernels,build_diffusion_kernels; build_elementwise_kernels(); build_diffusion_kernels()",
         )
     if fingerprint(commit, base_site, backend_manifest()) != key:
         raise ValueError("构建期间源文件变化，未激活私有环境")
@@ -294,13 +294,13 @@ def prepare(with_vpipe=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--with-vpipe",
+        "--with-aot-kernels",
         action="store_true",
-        help="显式构建现有 vpipe 和 diffusion RoPE AOT；需要 Apple Metal compiler",
+        help="显式构建通用 elementwise 和 diffusion RoPE AOT；需要 Apple Metal compiler",
     )
     args = parser.parse_args()
     try:
-        print(prepare(args.with_vpipe))
+        print(prepare(args.with_aot_kernels))
     except Exception as error:
         print(f"QwenImage 私有运行时准备失败：{error}", file=sys.stderr)
         sys.exit(1)

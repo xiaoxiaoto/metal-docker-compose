@@ -32,7 +32,7 @@ def rotary(x, freqs):
 
 
 def mps_rotary(x, freqs):
-    from vllm_omni_metal.ops.vpipe_kernels import supports_interleaved_rotary
+    from vllm_omni_metal.ops.aot_kernels import supports_interleaved_rotary
 
     if not _enabled() or not supports_interleaved_rotary(x, freqs):
         return None
@@ -106,9 +106,9 @@ class QwenMetalAdapter:
             "pipeline_qwen_image_21.py",
         ):
             digest.update(Path(__file__).with_name(name).read_bytes())
-        from vllm_omni_metal.ops import vpipe_kernels
+        from vllm_omni_metal.ops import aot_kernels
 
-        for module in (diffusion_ops, vpipe_kernels):
+        for module in (diffusion_ops, aot_kernels):
             digest.update(Path(module.__file__).read_bytes())
         config = self.pipeline.od_config
         descriptor = {
@@ -119,8 +119,8 @@ class QwenMetalAdapter:
             "vae_slicing": config.vae_use_slicing,
             "vae_tiling": config.vae_use_tiling,
             "gpu_operators": "auto",
-            "aot_silu": vpipe_kernels._artifact_path(torch.bfloat16).is_file(),
-            "aot_rotary": vpipe_kernels._diffusion_artifact_path(torch.bfloat16).is_file(),
+            "aot_silu": aot_kernels._artifact_path(torch.bfloat16).is_file(),
+            "aot_rotary": aot_kernels._diffusion_artifact_path(torch.bfloat16).is_file(),
         }
         digest.update(json.dumps(descriptor, sort_keys=True, default=str).encode())
         return digest.hexdigest()

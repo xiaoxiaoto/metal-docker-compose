@@ -46,7 +46,7 @@ async def worker(args):
     from vllm_omni.diffusion.utils.image_output import extract_images_from_outputs
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    from vllm_omni_metal.ops.vpipe_kernels import (
+    from vllm_omni_metal.ops.aot_kernels import (
         _artifact_path,
         _diffusion_artifact_path,
     )

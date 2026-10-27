@@ -467,7 +467,7 @@ docker compose -f ../docker-compose.yml config --quiet
 | MLX bridge | 54.953 / 61.322 | 58.138 |
 | Torch stream | 41.130 / 41.079 | 41.105 |
 
-本次耗时比1.414×、延迟降低29.30%；仅此输入/设备的两次样本，不外推其他负载。输出20.4787秒、48kHz双声道，有限非静音；各路重复及跨路浮点音频完全一致，每请求14364次AR paged attention命中已核对。ANE明确关闭，vpipe AOT产物不存在，不能将收益归因于ANE或新融合shader。原始记录/WAV在相邻后端的 `outputs/yue2-real-current-20261015-204628/`。
+本次耗时比1.414×、延迟降低29.30%；仅此输入/设备的两次样本，不外推其他负载。输出20.4787秒、48kHz双声道，有限非静音；各路重复及跨路浮点音频完全一致，每请求14364次AR paged attention命中已核对。ANE明确关闭，当时通用 elementwise AOT产物不存在，不能将收益归因于ANE或新融合shader，也不代表当前命名迁移后的产物状态。原始记录/WAV在相邻后端的 `outputs/yue2-real-current-20261015-204628/`。
 
 11项CPU行为回归通过；真实ANE拒绝复验在prepare立即退出且正常清理，没有继续使用关闭组生成。环境元数据将TorchVersion转换为普通字符串后通过安全msgpack编码，不启用不安全pickle。本次GPU及拒绝运行的进程均已退出。
 
