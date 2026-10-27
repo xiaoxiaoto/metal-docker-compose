@@ -18,7 +18,9 @@
 
 ## 环境、启动和停止
 
-需要 Apple Silicon macOS 15+、MPS、Python 3.9+（启动准备）、ModelScope CLI，以及根目录共享后端/总代理要求的工具。实际执行以下根入口命令会在缺少 plist 时准备软件和权重，模型仍等待首次推理才加载；仅阅读代码无需执行。
+需要 Apple Silicon macOS 15+、MPS、Python 3.11+（根控制脚本与启动引导）、ModelScope CLI，以及根目录共享后端/总代理要求的工具。共享运行时由 uv 托管，要求 Python `>=3.12,<3.13`；共享依赖仅由根目录 [`pyproject.toml`](../pyproject.toml) / [`uv.lock`](../uv.lock) 声明，以 `uv sync --locked` 非 editable 安装：vLLM/Metal `0.32.0`，Omni 固定 `9842ebc17cf1d9c6b440ecb6a79039162f68a1dd`，Omni Metal 来自 `https://github.com/xiaoxiaoto/vllm-omni-metal.git` 的 `5774df7d720b3a8c6d32035729b42c31e480f346`。共享准备不依赖相邻源码，保留官方联网预检但不随 main 自动升级，MPS 与 `pip check` 等验证通过后才激活；模型私有 overlay 的源码与基线门禁流程不变，详见[根目录合同](../README.md)。实际执行以下根入口命令会在缺少 plist 时准备软件和权重，模型仍等待首次推理才加载；仅阅读代码无需执行。
+
+vLLM 与 vllm-metal 也从官方 GitHub 源码安装，分别固定 `vllm-project/vllm` 的 `5df63a7203cdb9328d824a27b682e77c7b9928be` 与 `vllm-project/vllm-metal` 的 `6d6f2c37f8242f1ff1a336534adf6c2d2fe2936d`（v0.32.0）；由 uv 隔离构建非 editable wheel，不使用官方预编译 wheel。vLLM 的 CPU 编译形态只是 Metal 插件底座，不代表模型 CPU fallback。
 
 ```bash
 # 首次更新代理路由：会中断在途请求，先确认可重载

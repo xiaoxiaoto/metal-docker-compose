@@ -45,7 +45,7 @@ YuE2、Higgs、SeedVR2、Qwen-Image分别以 `YUE2_METAL_`、`HIGGS_METAL_`、
 历史策略/音频/权重/profile资产保留，不自动迁移批准。
 
 共享及私有ready校验使用选定Python `-I` 导入
-`quantization.capture`／`adapter`／`runtime`；现有递归源码指纹自动覆盖新模块。
+`quantization.capture`／`adapter`／`runtime`；共享指纹覆盖配置、锁文件及校验源码，Git commit 固定远端实现；私有 overlay 保留各自源码指纹。
 四模型私有校准器由正常Omni wheel分发、校验源码SHA与RECORD归属，离线CLI仍从
 各部署源码执行。普通nn.Linear、TP1未量化vLLM全投影、Diffusers未注册components
 已接通用执行适配；MLX自管理对象必须提供完整scope与apply hook，缺合同明确错误，
@@ -166,11 +166,27 @@ Higgs / YuE2 / MOSS 已移除各自的纯 Nginx Compose，不再使用原来的�
 
 后端准备器读取 macOS 系统 HTTP/HTTPS 代理并传给 Git、uv 和 pip；已有同名大小写代理环境变量（包括空值）优先，不硬编码端口、不关闭 TLS 校验。准备完成前统一入口可能不可用，应等待根目录命令成功后再执行身份检查和真实推理 curl。
 
-1. 查询官方 vLLM / Metal 最新稳定标签与 Omni main commit，保留兼容版本门禁。当前验证组合为 vLLM/Metal `0.32.0`、Omni/Omni Metal `0.32.0.dev0`；新核心超出矩阵直接失败，不删除旧环境或混装。
-2. 获取共享准备锁，原子 drain 并停止生命周期管理器；有在途、加载或未确认完成的请求时拒绝。随后按逆序执行全部模型停止入口，包括 H2O shim；任一步失败不删除环境。
+共享后端的 Python 版本、直接依赖与来源统一声明在根目录 `pyproject.toml`，完整运行依赖由 `uv.lock` 锁定，`.python-version` 选择 3.12。需预先安装 uv 0.11.7+；引导准备/版本校验脚本的 `python3` 需 3.11+（标准库 `tomllib`），共享后端固定为 **uv 托管的 CPython 3.12**，匹配 Metal wheel 的 cp312 ABI，不选系统、Homebrew 或 Conda 解释器。准备器从 `requires-python` 读取版本范围，先安装/发现托管解释器，再检查锁文件是否与声明一致；这些步骤失败均不停止现有服务。uv 的托管 Python 不属于共享环境清理范围，不要在依赖环境使用期间执行 `uv python uninstall`。
+
+四个核心包均从 GitHub 固定 commit 的源码安装，来源统一在 `pyproject.toml` 声明，由 `uv.lock` 锁定解析结果：vLLM 来自 [vllm-project/vllm](https://github.com/vllm-project/vllm) 的 `5df63a7203cdb9328d824a27b682e77c7b9928be`，使用该 commit 的官方源码归档并锁定 SHA256，避免抓取整个 Git 历史；Metal 来自 [vllm-project/vllm-metal](https://github.com/vllm-project/vllm-metal) 的 `6d6f2c37f8242f1ff1a336534adf6c2d2fe2936d`（均 v0.32.0）；Omni 来自官方仓库 `9842ebc17cf1d9c6b440ecb6a79039162f68a1dd`；Omni Metal 来自 [指定仓库](https://github.com/xiaoxiaoto/vllm-omni-metal) 的 `5774df7d720b3a8c6d32035729b42c31e480f346`。uv 隔离构建非 editable wheel，不使用这些包的官方预编译 wheel，也不读取相邻源码仓库或运行其安装脚本。vLLM 使用上游 CPU 构建目标并禁用预编译扩展复用，它是 Metal 插件底座，不代表模型 CPU fallback。模型私有补丁/overlay 继续由各模型准备器维护，不并入基础依赖。
+
+源码构建还需完整 Xcode、macOS SDK 26.2+、可用 Metal/clang++ 编译器和 Rust/Cargo，准备器在停止服务前检查工具链。`vllm-metal` 的 wheel 打包不会自动编译原生扩展，因此安装后由 `prepare_native.py` 调用上游构建接口，准备 MLX/MPS launcher 和 Metal 库，并将真实产物的 SHA256/大小登记到安装包 RECORD，维持 H2O 私有 overlay 的完整性合同；登记前后均核对原 wheel 源码，不能通过重算记录掩盖源码变更。随后构建 Omni Metal 的 Torch-stream launcher；这些操作只发生在准备阶段，不在请求期间编译。
+
+锁定范围仅为 macOS arm64。vLLM 的 CPU 元数据还包含不适用于本机的 Linux x86_64 Triton 直接 URL，uv 在平台裁剪前会尝试读取；`tool.uv.override-dependencies` 仅将这条非目标平台依赖转换为带 Linux x86_64 marker 的版本约束，避免无关下载。不修改安装包依赖元数据、不排除 Mac 运行依赖，仍执行完整 `pip check`；以后扩展平台时须重新验证该规则。
+
+升级须显式修改 `pyproject.toml` 的版本/来源 commit，再执行 `uv lock --python 3.12 --managed-python` 并验证新组合；仅刷新锁文件不代表已部署。启动只执行锁文件一致性检查和 `uv sync --locked`，不改锁、不跟随 main 升级，也不使用根目录 `.venv` 作为模型后端。不要用普通 `uv sync` 代替部署入口，它不会执行安全停机、MPS 构建验收或发布 `current`。
+
+1. 获取共享准备锁，联网查询官方 vLLM / Metal 最新稳定标签与 Omni main commit，保留兼容版本门禁。当前核心为 vLLM/Metal `0.32.0`、Omni/Omni Metal `0.32.0.dev0`；新核心超出配置的版本组合直接失败，不删除旧环境或混装。Omni main 前移只报告，不替换配置中固定的 commit；停止服务前检查 uv 托管 Python 和锁文件一致性。
+2. 原子 drain 并停止生命周期管理器；有在途、加载或未确认完成的请求时拒绝。随后按逆序执行全部模型停止入口，包括 H2O shim；任一步失败不删除环境。
 3. 核对 launchctl 任务退出、无残留进程引用环境后，仅删除 `~/.local/share/local-model-backend/runtime/<16位指纹>/`、`overlays/<模型>/<16位指纹>/` 和 `current` 链接。拒绝符号链接环境及异常所有权；其他资产、权重、下载缓存和日志保留。
-4. 在当前指纹的空目录运行相邻 `../vllm-omni-metal/install.sh --with-mps-attention`，再从干净源码副本安装非 editable 插件 wheel，不修改源仓库、Homebrew 或系统 Python。
-5. 用选定 Python `-I` 校验实际版本、`pip check`、MPS、非 editable 路径和 Torch-stream launcher；指纹未变且全部通过才写 `.ready` 与 `backend.json` 并原子激活 `current`。失败不恢复已删除环境；下次执行重新删除半成品并从空目录重建。
+4. 设置 `UV_PROJECT_ENVIRONMENT` 指向当前指纹的空目录，以 `uv sync --locked --no-dev --no-install-project` 从固定源码安装完整锁定依赖；强制 uv 托管解释器，核对新环境的基础解释器与预检选择一致。源码包由 uv 隔离构建非 editable wheel，不修改本地源仓库、Homebrew 或系统 Python。
+5. 显式准备 Metal 原生扩展/库与 Omni Metal 的 Torch-stream attention launcher，再以选定 Python `-I` 执行 `check_versions.py`、`check_backend.py` 和 `pip check`，验证源码来源/commit、模块、资源、CPU 数值合同、MPS、非 editable 路径及 launcher。配置/锁文件/校验源码参与指纹，全部通过且指纹未变才写 `.ready` 与 `backend.json` 并原子激活 `current`。失败不恢复已删除环境；下次执行从空目录重建。
+
+2026-10-27 uv 托管 Python 迁移验证：缺少 uv、解释器安装失败两条隔离回归均确认不停止服务、不删除旧环境或切换 current；临时目录真实创建 uv 虚拟环境，确认使用托管 CPython 3.12.9、原生 arm64，基础解释器路径与生成的 backend.json 一致。Python AST 与启停 Shell 语法检查通过。未执行实际共享后端重建、依赖安装、模型启动或统一入口推理，当前部署不会因本次代码修改自动切换解释器。
+
+同日集中依赖/源码安装验收：`uv.lock` 锁定229个包（含根虚拟项目），四个核心包均从上述固定源码构建非 editable wheel；全新临时环境安装228个依赖，未继承当前部署的 site-packages。以独立临时 HOME 重新编译 Omni launcher，避免复用现有运行时缓存。版本/源码来源、MLX Metal 库、基础 MPS 扩展、Omni MPS launcher、CPU profile/diffusion 数值合同、完整 `pip check` 均通过；真实 H2O `installed_resources()` 接受固定 Git 来源并核对原生 RECORD，MPS 平方计算得到 `[1.0, 4.0, 9.0]`。8项隔离回归、Python AST、Shell、Node、两份 Compose 配置及已准备缓存下的 `uv lock --check --offline` 通过。
+
+首次抓取/并发下载曾发生 TLS 中断；本次成功验证保留系统代理和 TLS 校验，使用 `UV_SYSTEM_CERTS=true`、`UV_CONCURRENT_DOWNLOADS=1`，源码编译限制为 `MAX_JOBS=2`。基础 Metal MPS 与 Omni MPS 的 pybind 类型不能在本次验收中混合注册，因此按独立执行器分别在子进程加载；**未验证同进程混合执行**。导入仍有 PyAV/OpenCV/Homebrew FFmpeg 的 Objective-C 重复类警告，未在本任务中处理。没有执行实际根目录重建、模型启动、统一入口推理或多模型质量验收，没有切换 `current`；临时环境和验证脚本在结束后清理，不能将本次小图/安装结果当作模型推理通过。应用时仍需先确认可中断请求，再运行所需 `./start.sh <目标>`，按下方对应模型的身份与真实推理 curl 验收。
 
 单目标命令只恢复该目标，其余模型保持停止；动态目标的私有环境和 plist 随准备重新生成，精度/量化参数按本次环境变量与脚本合同选择，不承诺保留旧 plist 的手工设置。需要全部部署时执行一次 `./start.sh all`，不要连续执行多个根目录启动命令并期待前一个模型仍在运行。
 

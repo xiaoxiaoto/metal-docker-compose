@@ -4,7 +4,7 @@ Apple Silicon 上运行上游原生 **QwenImage21Pipeline**，复用共享隔离
 
 - 官方在线示例：https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/text_to_image
 - 官方模型卡：https://modelscope.cn/models/Qwen/Qwen-Image-2.1-Turbo
-- 核对示例时的 Omni main：`1b6c6c50cf7aaaff82d579e41072a2fe0057d212`；实际运行版本由根目录联网预检和 `check_versions.py` 校验，不强行固定到未经共享后端验证的组合。
+- 历史核对示例时的 Omni main 为 `1b6c6c50cf7aaaff82d579e41072a2fe0057d212`；该记录不决定当前安装版本，当前共享来源以根目录锁文件为准，联网预检不自动跟随 main。
 - 对外 ID：**`qwen-image-2.1-turbo`**。下载仓库为 `Qwen/Qwen-Image-2.1-Turbo`，不把普通 Qwen-Image 示例中的模型名或 50 步参数照搬到本模型。
 - 单 generation pipeline，从 `model_index.json` 解析组件与采样；无需双阶段 Omni profile，不增加无需求的 `metal-deploy.yaml`。
 
@@ -14,7 +14,9 @@ Apple Silicon 上运行上游原生 **QwenImage21Pipeline**，复用共享隔离
 
 ## 环境与资源
 
-Apple Silicon、macOS 15+、Python 3.9+（模型准备脚本）、ModelScope CLI。网关另需 Docker Desktop。复用共享非 editable 基础环境的依赖与官方 Omni commit；`prepare_runtime.py` 在 Qwen 拥有的私有 overlay 内分别安装当前相邻后端和打补丁 Omni 的非 editable wheel。基础环境缺 diffusion／DynamicEngine API 时也不调用根准备器升级 current；兼容组为 vLLM/Metal `0.32.0`、Omni/Omni Metal `0.32.0.dev0`，私有 Omni 使用 `0.32.0.dev0+cpu.qwenmetal1`。不修改共享安装或其他模型环境。
+Apple Silicon、macOS 15+、Python 3.11+（根控制脚本与启动引导）、ModelScope CLI。网关另需 Docker Desktop。共享运行时由 uv 托管，要求 Python `>=3.12,<3.13`；共享依赖仅由根目录 [`pyproject.toml`](../pyproject.toml) / [`uv.lock`](../uv.lock) 声明，以 `uv sync --locked` 非 editable 安装：vLLM/Metal `0.32.0`，Omni 固定 `9842ebc17cf1d9c6b440ecb6a79039162f68a1dd`，Omni Metal 来自 `https://github.com/xiaoxiaoto/vllm-omni-metal.git` 的 `5774df7d720b3a8c6d32035729b42c31e480f346`。共享准备不依赖相邻源码；保留官方联网预检，不随 main 自动升级，MPS 与 `pip check` 等验证通过后才激活，详见[根目录合同](../README.md)。`prepare_runtime.py` 在 Qwen 拥有的私有 overlay 内仍分别安装当前相邻后端和打补丁 Omni 的非 editable wheel，私有 Omni 使用 `0.32.0.dev0+cpu.qwenmetal1`，保留自身来源兼容门禁。基础环境缺 diffusion／DynamicEngine API 时也不调用根准备器升级 current；不修改共享安装或其他模型环境。
+
+vLLM 与 vllm-metal 也从官方 GitHub 源码安装，分别固定 `vllm-project/vllm` 的 `5df63a7203cdb9328d824a27b682e77c7b9928be` 与 `vllm-project/vllm-metal` 的 `6d6f2c37f8242f1ff1a336534adf6c2d2fe2936d`（v0.32.0）；由 uv 隔离构建非 editable wheel，不使用官方预编译 wheel。vLLM 的 CPU 编译形态只是 Metal 插件底座，不代表模型 CPU fallback。
 
 模型卡的 Diffusers 直接运行示例要求开发版 Diffusers 与 Transformers ≥5.17；本部署走 **Omni 的原生实现**，不是 `diffusion_load_format=diffusers`，不能为了照搬该示例逐包升级共享依赖。原生组件能导入、小算子通过都不等于真实权重能完成生成。
 

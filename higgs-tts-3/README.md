@@ -10,15 +10,16 @@ Apple Silicon 本机使用 **vllm-omni + vllm-omni-metal**，执行上游原生 
 
 ## 环境
 
-- Apple Silicon macOS 15+、MPS、Homebrew、Python 3.9+（启动准备）、ModelScope CLI。根目录总代理另需 Docker Compose。
+- Apple Silicon macOS 15+、MPS、Homebrew、Python 3.11+（根控制脚本与启动引导）、ModelScope CLI；共享运行时由 uv 托管，要求 Python `>=3.12,<3.13`。根目录总代理另需 Docker Compose。
 - `start.sh` 使用根目录 `prepare_backend.py` 准备的统一隔离环境，再构建 Higgs 独占的正常 Omni wheel overlay。显式设置已验证的 `VLLM_BACKEND_PYTHON` 时子脚本不重复调用共享准备器；否则准备器同样先安全停止依赖模型、删除历史环境并重建。不使用独立 Homebrew HEAD 安装/升级流程。
-- 四个服务共用 vLLM/Metal `0.32.0` 与配套 Omni/Omni Metal `0.32.0.dev0`。Omni Metal 从相邻源码仓库构建非 editable wheel，包含通用输出协议修复；不依赖未发布的远端 Formula，不修改 Homebrew 或本地未提交源码。细节见根目录 `README.md`。
+- 共享依赖仅由根目录 [`pyproject.toml`](../pyproject.toml) / [`uv.lock`](../uv.lock) 声明，通过 `uv sync --locked` 非 editable 安装：vLLM/Metal `0.32.0`，Omni 固定 `9842ebc17cf1d9c6b440ecb6a79039162f68a1dd`，Omni Metal 固定 GitHub 仓库 `https://github.com/xiaoxiaoto/vllm-omni-metal.git` 的 `5774df7d720b3a8c6d32035729b42c31e480f346`。共享准备不依赖相邻源码；私有 overlay 的现有源码流程不变。详见[根目录合同](../README.md)。
+- vLLM 与 vllm-metal 也从官方 GitHub 源码安装，分别固定 `vllm-project/vllm` 的 `5df63a7203cdb9328d824a27b682e77c7b9928be` 与 `vllm-project/vllm-metal` 的 `6d6f2c37f8242f1ff1a336534adf6c2d2fe2936d`（v0.32.0）；由 uv 隔离构建非 editable wheel，不使用官方预编译 wheel。vLLM 的 CPU 编译形态只是 Metal 插件底座，不代表模型 CPU fallback。
 - `prepare.py` 自动扫描 `~/.cache/modelscope/hub/models/作者/模型/`，只提供完整且未量化的 `higgs_multimodal_qwen3` 缓存。唯一候选自动选择，多个候选编号选择，没有候选时输入 ModelScope 仓库名（如 `bosonai/higgs-audio-v3-tts-4b`），下载 `master` 后重新校验；完整缓存不重新下载。
 - 部署名称取所选模型卡仓库名 `/` 后的完整文本并转为全小写，例如 `bosonai/higgs-audio-v3-tts-4b` → `higgs-audio-v3-tts-4b`；`prepare.py` 依次输出部署名称、目录，供启动和健康检查复用。显式目录有 `.mdl` 时从中读取仓库名，否则沿用 `higgs-audio-v3-tts-4b`。更换模型时须同步根目录路由及身份检查。
 - `HIGGS_MODEL_DIR` 显式指定本地目录时优先使用并校验，不扫描、不下载；无交互 stdin 且需要选择时明确报错。`.mdl` 只解析字符串，不反序列化执行缓存代码。模型路径、索引及所有 safetensors 分片必须完整，量化模型及其他架构不会进入候选列表。
-- 软件准备从官方 Omni main 和本地后端源码构建一致版本组；模型只在准备阶段下载，launchctl 离线加载。构建失败不恢复旧环境，模型缓存保留。
+- 软件准备保留官方联网预检，但不会随 Omni main 自动升级；MPS 与 `pip check` 等安装验证通过后才激活共享环境。模型只在准备阶段下载，launchctl 离线加载。构建失败不恢复旧环境，模型缓存保留。
 - 根目录 `./start.sh higgs` / `all` 每次传入本轮重建的 `VLLM_BACKEND_PYTHON`，重新生成所选模型的私有环境和 plist，不再复用旧动态部署。
-- 后端已在 48 GiB Mac 验证；这里不是最低内存承诺。不要同时加载新旧两份服务。
+- 历史后端曾在 48 GiB Mac 验证；不是本次集中依赖变更的验收，也不是最低内存承诺。不要同时加载新旧两份服务。
 
 `metal-deploy.yaml` 基于上游 Higgs profile（已核对固定 Omni main，非 XPU 拓扑未变），保留原生 sampling、connector 和 async chunk。两个阶段设置 `max_num_seqs=1`、`CUSTOM` MPS SDPA、同步调度和关闭 prefix caching；Code2Wav 模型专用动态量化适配只存在于 Higgs 私有 Omni wheel。每阶段 `gpu_memory_utilization=0.3`，KV 分配保留系统内存 headroom。
 

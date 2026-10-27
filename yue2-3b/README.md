@@ -45,7 +45,8 @@ Omni最新main已前移，未借本次修复迁移共享环境。
 ## 原生拓扑和版本
 
 - YuE2 是单阶段 `AR（semantic tokens）→ terminal NAR flow matching → VAE`，不是 Higgs 的 Talker → Code2Wav 双阶段，不能复用其 connector 或 codec 配置。
-- 共享兼容组为 vLLM / vllm-metal `0.32.0` 与配套 Omni / Omni Metal 开发版，实际 Omni commit 由根目录联网预检决定；每次根目录启动都重建共享环境，私有准备器仍保留自身来源兼容门禁。不要混用历史 overlay 或桥接模块布局。
+- 共享依赖仅由根目录 [`pyproject.toml`](../pyproject.toml) / [`uv.lock`](../uv.lock) 声明，使用 `uv sync --locked` 非 editable 安装：vLLM / vllm-metal `0.32.0`，Omni 固定 `9842ebc17cf1d9c6b440ecb6a79039162f68a1dd`，Omni Metal 来自 `https://github.com/xiaoxiaoto/vllm-omni-metal.git` 的 `5774df7d720b3a8c6d32035729b42c31e480f346`。共享准备不依赖相邻源码；官方联网预检不决定新 commit、不自动升级 main，MPS 与 `pip check` 等验证通过后才激活。每次根目录启动都重建共享环境，私有准备器仍保留自身源码流程与来源兼容门禁。不要混用历史 overlay 或桥接模块布局；详见[根目录合同](../README.md)。
+- vLLM 与 vllm-metal 也从官方 GitHub 源码安装，分别固定 `vllm-project/vllm` 的 `5df63a7203cdb9328d824a27b682e77c7b9928be` 与 `vllm-project/vllm-metal` 的 `6d6f2c37f8242f1ff1a336534adf6c2d2fe2936d`（v0.32.0）；由 uv 隔离构建非 editable wheel，不使用官方预编译 wheel。vLLM 的 CPU 编译形态只是 Metal 插件底座，不代表模型 CPU fallback。
 - checkpoint 的架构名是 `YuE2ForCausalLM`，profile 用 `hf_overrides.architectures: [Yue2ForCausalLM]` 选择 Omni 原生类，不执行 checkpoint remote code。
 - YuE2 的实际文本 tokenizer 是本地 `qwen.tiktoken`，engine 接收 token IDs 并设置 `skip_tokenizer_init: true`。本 profile 显式用 `tokenizer: null` 覆盖上游无用的 `gpt2` 占位引用，避免 vLLM 在离线模式下仍尝试解析 GPT-2 缓存；不额外下载 GPT-2，也不关闭离线限制。
 - 同时需要未量化 `m-a-p/YuE2-3B`（AR/NAR BF16，约 7.26 GB）和标准 `m-a-p/YuE2-Vae`（FP32，约 0.53 GB）；输出目标是 **48 kHz 双声道**。默认使用 ModelScope 完整下载并保留仓库文件/缓存元数据，不安装仓库内的推理 wheel；显式选择 HF 时只下载模型必需文件。
@@ -53,7 +54,7 @@ Omni最新main已前移，未借本次修复迁移共享环境。
 
 ## Apple Silicon / Metal
 
-需要 Apple Silicon、macOS 15+、Homebrew、Python 3.9+（准备脚本）、ModelScope CLI；根目录总代理另需 Docker Compose。与 Higgs 相同：模型在 macOS launchctl 中运行，本目录不再运行 Docker 代理，不能在 Linux 容器中使用 Metal。
+需要 Apple Silicon、macOS 15+、Homebrew、Python 3.11+（根控制脚本与启动引导）、ModelScope CLI；uv 托管的共享运行时要求 Python `>=3.12,<3.13`。根目录总代理另需 Docker Compose。与 Higgs 相同：模型在 macOS launchctl 中运行，本目录不再运行 Docker 代理，不能在 Linux 容器中使用 Metal。
 
 `patches/yue2-mps.patch` 对固定 Omni 源码进行小范围修复，保留原生采样、NAR/VAE 算法及错误处理：
 

@@ -30,7 +30,9 @@ python3 h2o-lightning-4b/prepare.py --check-model
 
 ## 运行合同与启停
 
-需要 Apple Silicon、macOS ≥ 15、系统 Python ≥ 3.9、Docker Desktop 和根目录准备的 Python 3.12 共享后端。规范 ID 为 **`h2o-lightning-4b`**，原生 vLLM Metal 本机端口 `8000`、官方 shim `127.0.0.1:8740`、统一入口 `http://127.0.0.1/v1/`。
+需要 Apple Silicon、macOS ≥ 15、Python ≥ 3.11（根控制脚本与启动引导）、Docker Desktop 和 uv 托管的 Python `>=3.12,<3.13` 共享后端。共享依赖仅由根目录 [`pyproject.toml`](../pyproject.toml) / [`uv.lock`](../uv.lock) 声明，使用 `uv sync --locked` 非 editable 安装；vLLM/Metal 为 `0.32.0`，Omni 固定 `9842ebc17cf1d9c6b440ecb6a79039162f68a1dd`，Omni Metal 来自 `https://github.com/xiaoxiaoto/vllm-omni-metal.git` 的 `5774df7d720b3a8c6d32035729b42c31e480f346`，不依赖相邻源码。保留官方联网预检，不随 main 自动升级，MPS 与 `pip check` 等验证通过后才激活；私有补丁 wheel 流程不变，详见[根目录合同](../README.md)。规范 ID 为 **`h2o-lightning-4b`**，原生 vLLM Metal 本机端口 `8000`、官方 shim `127.0.0.1:8740`、统一入口 `http://127.0.0.1/v1/`。
+
+vLLM 与 vllm-metal 也从官方 GitHub 源码安装，分别固定 `vllm-project/vllm` 的 `5df63a7203cdb9328d824a27b682e77c7b9928be` 与 `vllm-project/vllm-metal` 的 `6d6f2c37f8242f1ff1a336534adf6c2d2fe2936d`（v0.32.0）；由 uv 隔离构建非 editable wheel，不使用官方预编译 wheel。vLLM 的 CPU 编译形态只是 Metal 插件底座，不代表模型 CPU fallback。
 
 - **同一 vLLM Metal 引擎支持 two-way、one-way 与 BOX 三条路径。** shim 默认 `bidirectional`；请求 `attention_mode=bidirectional` / `two-way` 使用全注意力层双向读出，`causal` / `one-way` 使用单向读出，GDN 始终因果。BOX 是 `type=box` 的图像定位题，不是第三种 attention；它使用同一引擎的因果多 token 生成，再由官方 shim 解析坐标、校准置信度和读取目标存在概率。
 - `patches/vllm-metal-bidirectional.patch` 基于官方 `vllm-metal v0.32.0` commit `6d6f2c37f8242f1ff1a336534adf6c2d2fe2936d`，不引入社区 MLX facade、其他 server 或 CUDA/Triton fork。Metal 本身使用的计算库沿用共享依赖，不创建另一套推理框架。
@@ -44,7 +46,7 @@ python3 h2o-lightning-4b/prepare.py --check-model
 
 ### 补丁式安装边界
 
-`prepare_runtime.py` 从固定官方 commit 导出干净副本（不覆盖相邻源码工作区），先 `git apply --check`，再应用补丁；补丁只添加请求级 attention mode 合同/调度与原生 FP32 head，不改 Metal shader。复用已安装官方发行 wheel 中经 RECORD 校验的同 ABI 原生扩展与 `.metallib`；原生源码必须逐字匹配，不能把旧二进制配给变化的 shader。Python 改动通过非 editable wheel 安装到 `~/.local/share/local-model-backend/overlays/h2o-lightning-4b/<fingerprint>/`，其余依赖通过现有 `.pth` 模式继承共享基础环境。
+`prepare_runtime.py` 从固定官方 commit 导出干净副本（不覆盖相邻源码工作区），先 `git apply --check`，再应用补丁；补丁只添加请求级 attention mode 合同/调度与原生 FP32 head，不改 Metal shader。基础 Metal 必须从同一官方仓库/commit 非 editable 安装；共享 `prepare_native.py` 显式编译原生扩展与 `.metallib` 并登记 RECORD，本准备器复用这些经 SHA256/大小校验的同 ABI 产物。原生源码必须逐字匹配，不能把旧二进制配给变化的 shader，不再接受旧的预编译 Release wheel 来源。Python 改动通过非 editable wheel 安装到 `~/.local/share/local-model-backend/overlays/h2o-lightning-4b/<fingerprint>/`，其余依赖通过现有 `.pth` 模式继承共享基础环境。
 
 wheel 构建后逐文件比对归档与固定源码副本（包含 native resources），安装后校验私有模块路径、源码摘要、RECORD 与原生扩展加载；私有 `bin/vllm` launcher 指向该 overlay 的 Python。每次复用都重新检查版本、`pip check` 和加载，只有全部通过才发布 `.ready`。指纹覆盖固定基线、补丁、准备器、基础发行资源和解释器；不会修改已安装基础包、Homebrew、共享 `current` 或其他模型的 overlay；请求期间不下载、不打补丁、不编译。缺补丁、基线不匹配、依赖冲突或资源损坏均明确失败。
 
@@ -57,6 +59,8 @@ wheel 构建后逐文件比对归档与固定源码副本（包含 native resour
 停止 lifecycle 会影响统一入口，有在途请求时拒绝停止。根目录每次启动（包括默认/gateway/lifecycle）都会安全停止所有依赖模型并删除历史环境重建；单目标只恢复 H2O，其余模型不自动恢复。不要连续执行多个根目录启动命令并期待前一个模型仍运行。
 
 **验证边界：** 私有 wheel/RECORD、模块归属和原生 Metal 扩展加载检查不能替代真实推理。FP32 head 使用模型原生 forward 验证实际投影，不要求模型支持缺少原生 cache/位置初始化的独立 backbone 调用；不改变 selective logits 的能力门禁，不放宽官方 three-probe。实际启动与统一入口验收结果记录在末尾。
+
+2026-10-27 集中依赖迁移的本次边界：在全新临时共享环境，从固定官方 Metal 源码安装并编译原生库后，真实调用 `installed_resources()`，Git 来源/commit、版本、源码与原生 RECORD 校验通过；回归确认旧 Release 来源、错误 commit 和产物损坏会被拒绝。没有构建/激活本模型的私有 overlay、启动 H2O/shim 或执行 three-probe、BOX 与统一入口推理；原有 curl 仍用于实际部署后的验收。
 
 ## 统一入口验收
 

@@ -1,0 +1,33 @@
+[project]
+name = "metal-docker-compose"
+version = "0.1.0"
+description = "Apple Silicon 本机模型部署与共享后端依赖"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "vllm==0.32.0+cpu",
+    "vllm-metal==0.32.0",
+    "vllm-omni==0.32.0.dev0+cpu",
+    "vllm-omni-metal==0.32.0.dev0",
+    "pip>=25.3",
+    "setuptools>=77,<81",
+]
+
+[tool.uv]
+required-version = ">=0.11.7"
+package = false
+environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
+required-environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
+# uv 会提前读取非目标平台的直接 URL；本项目不支持 Linux x86_64。
+# 保留该平台的版本条件，避免为 Darwin arm64 解析下载 Triton Linux wheel。
+override-dependencies = ["triton==3.8.0+cpu; sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[tool.uv.sources]
+vllm = { url = "https://github.com/vllm-project/vllm/archive/5df63a7203cdb9328d824a27b682e77c7b9928be.tar.gz" }
+vllm-metal = { git = "https://github.com/vllm-project/vllm-metal.git", rev = "6d6f2c37f8242f1ff1a336534adf6c2d2fe2936d" }
+vllm-omni = { git = "https://github.com/vllm-project/vllm-omni.git", rev = "9842ebc17cf1d9c6b440ecb6a79039162f68a1dd" }
+vllm-omni-metal = { git = "https://github.com/xiaoxiaoto/vllm-omni-metal.git", rev = "5774df7d720b3a8c6d32035729b42c31e480f346" }
+
+[tool.uv.extra-build-variables]
+vllm = { VLLM_TARGET_DEVICE = "cpu", VLLM_VERSION_OVERRIDE = "0.32.0+cpu", VLLM_USE_PRECOMPILED = "0", VLLM_USE_PRECOMPILED_RUST = "0" }
+vllm-omni = { VLLM_OMNI_TARGET_DEVICE = "cpu", VLLM_OMNI_VERSION_OVERRIDE = "0.32.0.dev0+cpu" }

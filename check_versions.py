@@ -8,26 +8,40 @@ from pathlib import Path
 import plistlib
 import subprocess
 import sys
+import tomllib
 
 
-EXPECTED = {
-    "vllm": "0.32.0",
-    "vllm-metal": "0.32.0",
-    "vllm-omni": "0.32.0.dev0",
-    "vllm-omni-metal": "0.32.0.dev0",
-}
+def backend_config():
+    with Path(__file__).with_name("pyproject.toml").open("rb") as file:
+        return tomllib.load(file)
+
+
+def expected_versions():
+    config = backend_config()
+    sources = config["tool"]["uv"]["sources"]
+    expected = {}
+    for dependency in config["project"]["dependencies"]:
+        name, separator, version_pin = dependency.partition("==")
+        if name in sources:
+            if not separator or not version_pin:
+                raise ValueError(f"共享后端直接依赖必须固定版本：{dependency}")
+            expected[name] = version_pin
+    if set(expected) != set(sources):
+        raise ValueError("共享后端依赖与来源声明不一致")
+    return expected
 
 
 def check(omni=False):
-    names = tuple(EXPECTED) if omni else ("vllm", "vllm-metal")
+    expected = expected_versions()
+    names = tuple(expected) if omni else ("vllm", "vllm-metal")
     actual = {}
     for name in names:
         try:
             actual[name] = version(name)
         except PackageNotFoundError:
             raise ValueError(f"缺少后端包：{name}") from None
-    mismatches = [f"{name}={actual[name]}（需要 {EXPECTED[name]}）" for name in names
-                  if actual[name].split("+", 1)[0] != EXPECTED[name]]
+    mismatches = [f"{name}={actual[name]}（需要 {expected[name]}）" for name in names
+                  if actual[name].split("+", 1)[0] != expected[name].split("+", 1)[0]]
     if mismatches:
         raise ValueError("后端版本不匹配：" + "、".join(mismatches)
                          + "；请先停止共享环境的模型，再安装配套版本，不能混用或在运行中升级")

@@ -20,7 +20,9 @@ vLLM Metal 的 STT 路径则通过 MLX 执行模型，不直接运行 CUDA/PyTor
 
 ## 启停
 
-需要 Apple Silicon、macOS 15+、Homebrew、Python 3.9+（准备）、可用的 `modelscope` CLI；根目录总代理另需 Docker Compose。模型实际使用统一隔离后端的 Python 3.12。
+需要 Apple Silicon、macOS 15+、Homebrew、Python 3.11+（根控制脚本与启动引导）、可用的 `modelscope` CLI；根目录总代理另需 Docker Compose。模型实际使用 uv 托管的 Python `>=3.12,<3.13` 共享运行时。共享依赖仅由根目录 [`pyproject.toml`](../pyproject.toml) / [`uv.lock`](../uv.lock) 声明，以 `uv sync --locked` 非 editable 安装：vLLM/Metal `0.32.0`，Omni 固定 `9842ebc17cf1d9c6b440ecb6a79039162f68a1dd`，Omni Metal 来自 `https://github.com/xiaoxiaoto/vllm-omni-metal.git` 的 `5774df7d720b3a8c6d32035729b42c31e480f346`。共享准备不依赖相邻源码，保留官方联网预检但不随 main 自动升级，MPS 与 `pip check` 等验证通过后才激活；详见[根目录合同](../README.md)。
+
+vLLM 与 vllm-metal 也从官方 GitHub 源码安装，分别固定 `vllm-project/vllm` 的 `5df63a7203cdb9328d824a27b682e77c7b9928be` 与 `vllm-project/vllm-metal` 的 `6d6f2c37f8242f1ff1a336534adf6c2d2fe2936d`（v0.32.0）；由 uv 隔离构建非 editable wheel，不使用官方预编译 wheel。vLLM 的 CPU 编译形态只是 Metal 插件底座，不代表模型 CPU fallback。
 
 只准备、不立即加载：
 
@@ -46,9 +48,9 @@ curl -fsS 'http://127.0.0.1/v1/models?model=moss-transcribe-diarize'
 - 安装校验使用选定私有Python `-I`。MOSS走基础vllm-metal的MLX STT，不使用
   本插件执行层，不要求其量化API；与PaddleOCR/H2O等基础vLLM路由一样，
   不属于本次Omni DynamicEngine接入范围。不能用Omni入口接通冒充MOSS真实量化批准。
-- 原有真实 HTTP 验收使用 `0.30.0`，现在部署仅接受统一 `0.31.0` 核心。mlx-audio 接受 `0.5.8` / `0.5.9`，已核对两版 MOSS 模型目录源码相同；其他版本拒绝启动，升级后仍须真实转写验收。
+- 历史真实 HTTP 验收使用 `0.30.0`，不能作为当前统一 `0.32.0` 核心的验收。mlx-audio 的历史兼容检查覆盖 `0.5.8` / `0.5.9`，当时已核对两版 MOSS 模型目录源码相同；当前依赖以根锁文件及版本门禁为准，升级后仍须真实转写验收。
 - 插件限制为 `VLLM_PLUGINS=metal,moss_stt`，模型进程离线运行。使用单请求、8192 上下文、BF16，关闭 async scheduling、chunked prefill 和 prefix caching。
-- 本目录启停脚本只管理 MOSS，不要求 Docker，也不停止总代理。若共享后端版本/源码变化，根目录预检按公共策略停止所有已注册的本部署模型后再切换；这会中断在途请求。
+- 本目录启停脚本只管理 MOSS，不要求 Docker，也不停止总代理。根目录重建共享后端时按公共策略安全停止所有依赖模型；有在途请求或停止失败时拒绝继续，不删除旧环境。
 - launchctl 工作目录位于 Application Support，避免 Documents 的 macOS 隐私权限问题。总代理配置和启停见根目录 `README.md`。
 
 ### 模型准备

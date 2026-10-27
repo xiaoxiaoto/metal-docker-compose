@@ -47,12 +47,12 @@ def installed_resources():
             raise ValueError(f"补丁只验证 {name}=={expected}，实际为 {version(name)}")
     package = distribution("vllm-metal")
     source = json.loads(package.read_text("direct_url.json") or "{}")
-    expected_url = (
-        "https://github.com/vllm-project/vllm-metal/releases/download/v0.32.0/"
-        "vllm_metal-0.32.0-cp312-cp312-macosx_15_0_arm64.whl"
-    )
-    if source.get("url") != expected_url or source.get("dir_info", {}).get("editable"):
-        raise ValueError("需要共享后端的官方 v0.32.0 CPython 3.12 arm64 发行 wheel")
+    if (
+        source.get("url") != REPOSITORY
+        or source.get("vcs_info", {}).get("commit_id") != COMMIT
+        or source.get("dir_info", {}).get("editable")
+    ):
+        raise ValueError("需要共享后端从固定官方 v0.32.0 commit 构建的非 editable Metal")
     resources = {}
     for entry in package.files or ():
         relative = Path(str(entry))

@@ -5,18 +5,17 @@ import fcntl
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from urllib.request import getproxies
 
-from check_versions import EXPECTED
+from check_versions import backend_config, expected_versions
 
 PROJECT = Path(__file__).resolve().parent
-SOURCE = PROJECT.parent / "vllm-omni-metal"
 CACHE = Path.home() / ".local/share/local-model-backend"
 SERVICES = {
     "h2o": "com.local.h2o-lightning-vllm",
@@ -62,37 +61,57 @@ def stable_version(refs):
 
 
 def official_versions():
+    expected = expected_versions()
     latest = {
         name: stable_version(remote_refs(repo, "refs/tags/*"))
         for name, repo in (("vllm", "vllm-project/vllm"), ("vllm-metal", "vllm-project/vllm-metal"))
     }
-    if any(latest[name] != EXPECTED[name] for name in latest):
+    if any(latest[name] != expected[name].split("+", 1)[0] for name in latest):
         raise ValueError(
-            f"官方最新核心为 {latest}，当前后端只验证了 {EXPECTED}；"
+            f"官方最新核心为 {latest}，当前后端只验证了 {expected}；"
             "必须先更新并验证兼容组合，不能混装或静默启动旧版本"
         )
     refs = remote_refs("vllm-project/vllm-omni", "refs/heads/main").splitlines()
     if len(refs) != 1 or not re.fullmatch(r"[0-9a-f]{40}\trefs/heads/main", refs[0]):
         raise ValueError("无法确定官方 Omni 最新 main commit")
-    return dict(latest, omni_commit=refs[0].split()[0])
+    commit = backend_config()["tool"]["uv"]["sources"]["vllm-omni"]["rev"]
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("pyproject.toml 的 Omni rev 必须为完整 commit")
+    return dict(latest, omni_commit=commit, omni_latest_commit=refs[0].split()[0])
+
+
+def prepare_python():
+    """Prepare a uv-owned interpreter before disrupting existing services."""
+    if shutil.which("uv") is None:
+        raise ValueError("缺少 uv；请先安装 uv，再准备共享后端")
+    request = backend_config()["project"]["requires-python"]
+    run("uv", "python", "install", request, "--no-bin")
+    return Path(subprocess.check_output(
+        ["uv", "python", "find", request, "--managed-python", "--no-project"],
+        text=True,
+    ).strip()).resolve(strict=True)
 
 
 def fingerprint(latest):
-    digest = hashlib.sha256(json.dumps(dict(latest, expected=EXPECTED), sort_keys=True).encode())
+    identity = {key: value for key, value in latest.items() if key != "omni_latest_commit"}
+    digest = hashlib.sha256(json.dumps(dict(identity, expected=expected_versions()), sort_keys=True).encode())
     digest.update(Path(__file__).read_bytes())
-    files = [SOURCE / "pyproject.toml", SOURCE / "install.sh"]
-    files += sorted(
-        path
-        for path in (SOURCE / "vllm_omni_metal").rglob("*")
-        if path.is_file()
-        and "__pycache__" not in path.parts
-        and path.suffix != ".pyc"
-        and path.name != ".DS_Store"
-    )
-    for path in files:
-        digest.update(str(path.relative_to(SOURCE)).encode())
-        digest.update(path.read_bytes())
+    for name in ("pyproject.toml", "uv.lock", "check_versions.py", "check_backend.py", "prepare_native.py"):
+        digest.update((PROJECT / name).read_bytes())
     return digest.hexdigest()[:16]
+
+
+def check_build_tools():
+    for command in ("git", "xcrun", "rustc", "cargo"):
+        if shutil.which(command) is None:
+            raise ValueError(f"源码构建缺少工具：{command}")
+    run("xcrun", "--find", "metal")
+    run("xcrun", "--find", "clang++")
+    sdk = subprocess.check_output(
+        ["xcrun", "--sdk", "macosx", "--show-sdk-version"], text=True,
+    ).strip()
+    if tuple(map(int, sdk.split(".")[:2])) < (26, 2):
+        raise ValueError(f"Metal 源码构建需要 macOS SDK 26.2+，当前 {sdk}")
 
 
 def stop_models():
@@ -149,59 +168,36 @@ def remove_environments():
         shutil.rmtree(path)
 
 
-def install_plugin(runtime):
-    # Build from a clean copy: preserve the checkout and exclude stale build artifacts/editable paths.
-    with tempfile.TemporaryDirectory(prefix="omni-metal-wheel-") as temporary:
-        build = Path(temporary) / "source"
-        build.mkdir()
-        for name in ("pyproject.toml", "README.md", "LICENSE"):
-            shutil.copyfile(SOURCE / name, build / name)
-        shutil.copytree(
-            SOURCE / "vllm_omni_metal",
-            build / "vllm_omni_metal",
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store"),
-        )
-        wheels = Path(temporary) / "wheels"
-        python = str(runtime / "bin/python")
-        run(python, "-I", "-m", "pip", "wheel", "--no-deps", str(build), "--wheel-dir", str(wheels))
-        (wheel,) = wheels.glob("vllm_omni_metal-*.whl")
-        run(python, "-I", "-m", "pip", "install", "--no-deps", "--force-reinstall", str(wheel))
-
-
 def validate(runtime):
     python = str(runtime / "bin/python")
     run(python, "-I", str(PROJECT / "check_versions.py"), "--omni")
-    run(python, "-I", "-m", "pip", "check")
+    # 两个独立执行器的 pybind 类型不能混合注册；按实际服务边界分别验收。
     run(
-        python,
-        "-I",
-        "-c",
-        "import sys; from pathlib import Path; import vllm_omni_metal; "
-        "assert Path(vllm_omni_metal.__file__).resolve().is_relative_to(Path(sys.prefix).resolve()), "
-        "'backend must be installed, not editable or inherited from another environment'; "
-        "from vllm_omni_metal.ops.mps_attention import get_mps_ops; "
-        "from vllm_omni_metal.quantization.linear import QuantizedLinear, validate_profile; "
-        "from vllm_omni_metal.quantization.capture import CaptureSession; "
-        "from vllm_omni_metal.quantization.adapter import DenseModelAdapter; "
-        "from vllm_omni_metal.quantization.runtime import load_profile, configure_model_quantization; "
-        "from vllm_omni_metal.ane.projection import DenseProjection, prepare_projection; "
-        "assert get_mps_ops() is not None, 'Torch-stream attention launcher is not prepared'",
+        python, "-I", "-c",
+        "import torch; import vllm_metal.pytorch_backend._mps_ops; "
+        "print('基础 Metal MPS 原生扩展加载通过')",
     )
+    run(python, "-I", str(PROJECT / "check_backend.py"))
+    run(python, "-I", "-m", "pip", "check")
 
 
 def prepare():
-    if not (SOURCE / "install.sh").is_file():
-        raise ValueError(f"缺少用户指定的后端源码仓库：{SOURCE}")
+    if platform.system() != "Darwin" or platform.machine() != "arm64" or int(platform.mac_ver()[0].split(".")[0]) < 15:
+        raise ValueError("共享后端需要原生 Apple Silicon macOS 15+")
     inherit_system_proxies()
     CACHE.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (CACHE / ".prepare.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         latest = official_versions()
         print(
-            f"官方版本预检：vLLM/Metal {latest['vllm']}，Omni main {latest['omni_commit']}；"
+            f"官方版本预检：vLLM/Metal {latest['vllm']}，Omni main {latest['omni_latest_commit']}；"
+            f"使用锁定 Omni {latest['omni_commit']}，不随 main 自动升级；"
             "Omni/Omni Metal 使用配套开发版，不冒充稳定发布",
             file=sys.stderr,
         )
+        python = prepare_python()
+        check_build_tools()
+        run("uv", "lock", "--check", "--project", str(PROJECT), "--python", str(python))
         key = fingerprint(latest)
         runtime = CACHE / "runtime" / key
         ready = runtime / ".ready"
@@ -211,19 +207,25 @@ def prepare():
         runtime.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         print(f"从空目录重建兼容后端：{runtime}（不修改 Homebrew 或其他环境）", file=sys.stderr)
         run(
-            "bash",
-            str(SOURCE / "install.sh"),
-            "--venv",
-            str(runtime),
-            "--with-mps-attention",
-            env=dict(os.environ, VLLM_OMNI_COMMIT=latest["omni_commit"]),
+            "uv", "sync", "--locked", "--no-dev", "--no-install-project",
+            "--project", str(PROJECT), "--python", str(python),
+            env=dict(os.environ, UV_PROJECT_ENVIRONMENT=str(runtime), UV_CONCURRENT_BUILDS="1",
+                     UV_MANAGED_PYTHON="1", UV_NO_MANAGED_PYTHON="0"),
         )
-        install_plugin(runtime)
+        run(
+            str(runtime / "bin/python"), "-I", "-c",
+            "import sys; from pathlib import Path; "
+            "assert Path(sys._base_executable).resolve() == Path(sys.argv[1]), "
+            "'共享后端必须使用选定的 uv 托管 Python'",
+            str(python),
+        )
+        run(str(runtime / "bin/python"), "-I", str(PROJECT / "prepare_native.py"))
+        run(str(runtime / "bin/python"), "-I", "-m", "vllm_omni_metal.ops.mps_attention")
         validate(runtime)
         if fingerprint(latest) != key:
-            raise ValueError("后端源码在构建/校验期间发生变化；未激活该环境，请重试")
+            raise ValueError("后端配置或校验/构建源码在准备期间变化；未激活该环境，请重试")
         (runtime / "backend.json").write_text(
-            json.dumps(dict(latest, expected=EXPECTED), indent=2) + "\n"
+            json.dumps(dict(latest, expected=expected_versions(), python=str(python)), indent=2) + "\n"
         )
         ready.write_text(key)
         temporary = CACHE / f".current-{os.getpid()}"
