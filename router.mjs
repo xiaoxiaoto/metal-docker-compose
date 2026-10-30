@@ -8,6 +8,7 @@ const targets = {
     'paddleocr-vl': {location: '@paddleocr', limit: 25 * 1024 * 1024},
     'qwen-image-2.1-turbo': {location: '@qwenimage', limit: 64 * 1024},
     'seedvr2': {location: '@seedvr2', limit: 25 * 1024 * 1024},
+    'wevisone-vl-4b': {location: '@wevisone', limit: 25 * 1024 * 1024},
 };
 
 function multipartModel(body, contentType) {

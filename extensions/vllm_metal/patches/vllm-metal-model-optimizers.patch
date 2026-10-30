@@ -1,0 +1,339 @@
+diff --git a/vllm_metal/compiled_mlp.py b/vllm_metal/compiled_mlp.py
+index e4ec726..e48516a 100644
+--- a/vllm_metal/compiled_mlp.py
++++ b/vllm_metal/compiled_mlp.py
+@@ -82,6 +82,10 @@ class CompiledMLPBlocks:
+             for name, module in model.named_modules()
+             if type(module) in policies
+             and not any(name.startswith(prefix) for prefix in wrapper_prefixes)
++            and not any(
++                getattr(child, "metal_requires_eager", False) is True
++                for _, child in module.named_modules()
++            )
+         }
+         # Wrap outermost targets only: a target nested inside another (the
+         # MoE block's shared-expert MLP) compiles as part of the outer trace.
+diff --git a/vllm_metal/envs.py b/vllm_metal/envs.py
+index 77b9fee..8fbb027 100644
+--- a/vllm_metal/envs.py
++++ b/vllm_metal/envs.py
+@@ -110,6 +110,19 @@ def _auto_or_nonnegative_int(name: str, *, unit: str) -> Callable[[], int | str]
+     return parse
+ 
+ 
++def _model_optimizers() -> tuple[str, ...]:
++    name = "METAL_MODEL_OPTIMIZERS"
++    raw = os.getenv(name, "")
++    if raw == "":
++        return ()
++    selected = tuple(raw.split(","))
++    if any(not item or item != item.strip() for item in selected) or len(set(selected)) != len(selected):
++        raise ValueError(
++            f"{name} must contain distinct nonempty CSV names, got {raw!r}"
++        )
++    return selected
++
++
+ if TYPE_CHECKING:
+     VLLM_METAL_BACKEND: str = "mlx"
+     VLLM_MLX_DEVICE: str = "gpu"
+@@ -119,6 +132,7 @@ if TYPE_CHECKING:
+     VLLM_METAL_GDN_LAZY_KERNELS: bool = True
+     VLLM_METAL_DECODE_PIPELINE: bool = True
+     VLLM_METAL_COMPILED_MLP: bool = False
++    METAL_MODEL_OPTIMIZERS: tuple[str, ...] = ()
+     VLLM_METAL_NATIVE_SAMPLING: bool = False
+     VLLM_METAL_MLA_KERNEL: bool = False
+     VLLM_METAL_DISABLE_NAX: bool = False
+@@ -133,6 +147,7 @@ if TYPE_CHECKING:
+     VLLM_METAL_KV_COMMIT_PROBE: bool = True
+ 
+ environment_variables: dict[str, Callable[[], Any]] = {
++    "METAL_MODEL_OPTIMIZERS": _model_optimizers,
+     # Opt-in PyTorch MPS backend; model capabilities are checked by the worker.
+     "VLLM_METAL_BACKEND": _choice("VLLM_METAL_BACKEND", "mlx", ("mlx", "mps")),
+     # MLX device type: "gpu" (default) or "cpu".
+diff --git a/vllm_metal/v1/model_runner.py b/vllm_metal/v1/model_runner.py
+index 3a58126..20e60a7 100644
+--- a/vllm_metal/v1/model_runner.py
++++ b/vllm_metal/v1/model_runner.py
+@@ -76,6 +76,7 @@ from vllm_metal.distributed import (
+ )
+ from vllm_metal.metal import get_ops
+ from vllm_metal.metal.constants import PA_WINDOW_MAX_HEAD_SIZE
++from vllm_metal_extensions.model_optimizers import apply_model_optimizers
+ from vllm_metal.multimodal import merge_multimodal_embeddings
+ from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
+ from vllm_metal.v1.cache_policy import ModelCachePolicy
+@@ -701,6 +702,9 @@ class MetalModelRunner:
+         """Load the configured model and derive runtime metadata."""
+         self._model_lifecycle.load()
+         if self._uses_encoder_pooling_backend():
++            self.model_optimizer_metadata = apply_model_optimizers(
++                self.model, self.vllm_config
++            )
+             return
+         if self._diffusion is not None:
+             validate_diffusion_model(self.model)
+@@ -708,6 +712,9 @@ class MetalModelRunner:
+         # cache profiling materialize weights. No-op on the single-stage path.
+         if self.pp is not None:
+             self.apply_pipeline_split(self.pp)
++        self.model_optimizer_metadata = apply_model_optimizers(
++            self.model, self.vllm_config
++        )
+         # Wraps modules in place, so it runs after the split prunes
+         # non-owned layers (load -> split -> install; ordering test pins it).
+         self._model_lifecycle.install_decode_dispatch()
+diff --git a/vllm_metal/v1/stt_model_runner.py b/vllm_metal/v1/stt_model_runner.py
+index c30d4ff..227912f 100644
+--- a/vllm_metal/v1/stt_model_runner.py
++++ b/vllm_metal/v1/stt_model_runner.py
+@@ -30,6 +30,7 @@ from vllm.v1.kv_cache_interface import (
+ from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+ from vllm.v1.sample.sampler import Sampler
+ 
++from vllm_metal_extensions.model_optimizers import apply_model_optimizers
+ from vllm_metal.stt.loader import resolve_model_path
+ from vllm_metal.stt.policy import STT_SCHED_BLOCK_BYTES, STT_SCHED_NOMINAL_HEAD_SIZE
+ from vllm_metal.stt.runtime import STTRuntimeAdapter
+@@ -72,6 +73,7 @@ class STTModelRunner:
+         )
+         model = load_stt_model(model_name, self.model_config.dtype)
+         self.model = model
++        self.model_optimizer_metadata = apply_model_optimizers(model, self.vllm_config)
+         self.tokenizer = None
+         self._stt_runtime_adapter = model.create_runtime_adapter(model_name)
+ 
+--- a/vllm_metal/pytorch_backend/mps_ops.mm
++++ b/vllm_metal/pytorch_backend/mps_ops.mm
+@@ -5,6 +5,8 @@
+ #include <torch/extension.h>
+ #include <ATen/mps/MPSStream.h>
+ #include <ATen/native/mps/OperationUtils.h>
++#include <mach/mach.h>
++#include <mutex>
+ #include <string>
+ #include <unordered_map>
+ 
+@@ -28,6 +30,51 @@
+   id<MTLLibrary> nax_library_ = nil;
+   std::unordered_map<std::string, id<MTLComputePipelineState>> pipelines_;
+   int gpu_cores_;
++  bool reuse_scratch_;
++  // Bounded workspace for the first split stream; other streams own temporaries.
++  std::mutex mutex_;
++  at::mps::MPSStream* scratch_stream_ = nullptr;
++  Tensor scratch_tmp_, scratch_sums_, scratch_maxes_;
++  static constexpr int64_t kScratchBudget = 256LL * 1024 * 1024;
++
++  static void check_headroom(int64_t bytes) {
++    vm_statistics64_data_t vm;
++    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
++    vm_size_t page_size;
++    auto host = mach_host_self();
++    auto stats_result = host_statistics64(
++        host, HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vm), &count);
++    auto page_result = host_page_size(host, &page_size);
++    mach_port_deallocate(mach_task_self(), host);
++    TORCH_CHECK(stats_result == KERN_SUCCESS && page_result == KERN_SUCCESS,
++                "Cannot determine MPS attention system memory headroom");
++    const uint64_t available =
++        (static_cast<uint64_t>(vm.free_count) + vm.inactive_count) * page_size;
++    TORCH_CHECK(available >= 3ULL * 1024 * 1024 * 1024 + bytes,
++                "MPS attention allocation requires 3 GiB system memory headroom");
++  }
++
++  void scratch(at::mps::MPSStream* stream, const Tensor& q,
++               int64_t elements, int64_t statistics, Tensor& tmp, Tensor& sums, Tensor& maxes) {
++    const auto bytes = elements * q.element_size() + statistics * 8;
++    TORCH_CHECK(bytes <= kScratchBudget, "MPS attention scratch exceeds 256 MiB per-call budget");
++    if (scratch_stream_ == nullptr) scratch_stream_ = stream;
++    const bool owner = stream == scratch_stream_;
++    if (owner && scratch_tmp_.defined() &&
++        scratch_tmp_.scalar_type() == q.scalar_type() &&
++        scratch_tmp_.numel() >= elements && scratch_sums_.numel() >= statistics) {
++      tmp = scratch_tmp_; sums = scratch_sums_; maxes = scratch_maxes_;
++      return;
++    }
++    check_headroom(bytes);
++    tmp = at::empty({elements}, q.options());
++    sums = at::empty({statistics}, q.options().dtype(at::kFloat));
++    maxes = at::empty_like(sums);
++    if (owner) {
++      // Encoded commands retain old buffers; never cache a shape-indexed set.
++      scratch_tmp_ = tmp; scratch_sums_ = sums; scratch_maxes_ = maxes;
++    }
++  }
+ 
+   id<MTLComputePipelineState> pipeline(const std::string& name, bool split = false,
+                                       int window_q = 0) {
+@@ -71,8 +118,9 @@
+   }
+ 
+  public:
+-  PagedAttention(const std::string& path, const std::string& nax_path, int gpu_cores)
+-      : gpu_cores_(gpu_cores) {
++  PagedAttention(const std::string& path, const std::string& nax_path, int gpu_cores,
++                 bool reuse_scratch)
++      : gpu_cores_(gpu_cores), reuse_scratch_(reuse_scratch) {
+     @autoreleasepool {
+       auto device = at::mps::getCurrentMPSStream()->device();
+       NSError* error = nil;
+@@ -100,8 +148,16 @@
+                const Tensor& blocks, const Tensor& lens, const Tensor& cu,
+                const Tensor& out, int max_seq_len, double scale,
+                int sliding_window, double softcap, int window_seqlen_q) {
++    std::lock_guard<std::mutex> lock(mutex_);
+     for (auto* t : {&q, &k, &v, &kc, &vc, &slots, &blocks, &lens, &cu, &out})
+       TORCH_CHECK(t->is_mps(), "All paged attention buffers must be on MPS");
++    if (reuse_scratch_) {
++      for (auto* t : {&q, &k, &v, &kc, &vc, &slots, &blocks, &lens, &cu})
++        TORCH_CHECK(!out.is_alias_of(*t),
++                    "Attention output must not share storage with inputs or KV cache");
++      TORCH_CHECK(!out.requires_grad() && !out.is_conj() && !out.is_neg(),
++                  "Attention output must be a plain tensor without autograd");
++    }
+     TORCH_CHECK(q.dim() == 3 && q.is_contiguous() &&
+                 (q.size(2) == 64 || q.size(2) == 96 || q.size(2) == 128 ||
+                  q.size(2) == 256 || q.size(2) == 512),
+@@ -125,7 +181,10 @@
+                 "Attention metadata must be contiguous");
+     const int tokens = q.size(0), heads = q.size(1), kv_heads = kc.size(2);
+     const int seqs = lens.numel();
+-    const int parts = (max_seq_len + kPartitionSize - 1) / kPartitionSize;
++    if (reuse_scratch_)
++      TORCH_CHECK(max_seq_len > 0 && tokens > 0 && heads > 0 && kv_heads > 0 && seqs > 0,
++                  "Attention dimensions and maximum sequence length must be positive");
++    const int parts = (static_cast<int64_t>(max_seq_len) + kPartitionSize - 1) / kPartitionSize;
+     TORCH_CHECK(k.sizes() == v.sizes() && k.dim() == 3 && k.size(0) == tokens &&
+                 k.size(1) == kv_heads && k.size(2) == head_size &&
+                 k.stride(2) == 1 && k.stride(1) == head_size &&
+@@ -152,15 +211,24 @@
+             dt, dt, dt, head_size, block_size, split ? kPartitionSize : 0);
+     auto attn = pipeline(name, split, window_q);
+     id<MTLComputePipelineState> reduce = nil;
++    auto stream = at::mps::getCurrentMPSStream();
+     Tensor tmp, sums, maxes;
+     if (split) {
+-      tmp = at::empty({tokens, heads, parts, head_size}, q.options());
+-      sums = at::empty({tokens, heads, parts}, q.options().dtype(at::kFloat));
+-      maxes = at::empty_like(sums);
++      if (reuse_scratch_) {
++        // Check before multiplying so pathological dimensions cannot overflow.
++        const int64_t max_statistics = kScratchBudget / (head_size * q.element_size() + 8);
++        TORCH_CHECK(static_cast<int64_t>(tokens) <= max_statistics / heads / parts,
++                    "MPS attention scratch exceeds 256 MiB per-call budget");
++        const int64_t statistics = static_cast<int64_t>(tokens) * heads * parts;
++        scratch(stream, q, statistics * head_size, statistics, tmp, sums, maxes);
++      } else {
++        tmp = at::empty({tokens, heads, parts, head_size}, q.options());
++        sums = at::empty({tokens, heads, parts}, q.options().dtype(at::kFloat));
++        maxes = at::empty_like(sums);
++      }
+       reduce = pipeline(
+           kernels::paged_reduce_kernel_name(dt, head_size, kPartitionSize));
+     }
+-    auto stream = at::mps::getCurrentMPSStream();
+     at::mps::dispatch_sync_with_rethrow(stream->queue(), ^{
+       @autoreleasepool {
+         auto enc = stream->commandEncoder();
+@@ -227,6 +295,8 @@
+         &hardware::override_detected_gpu_core_count_for_test);
+   m.def("nax_supported", &nax_supported);
+   pybind11::class_<PagedAttention>(m, "PagedAttention")
+-      .def(pybind11::init<const std::string&, const std::string&, int>())
++      .def(pybind11::init<const std::string&, const std::string&, int, bool>(),
++           pybind11::arg("path"), pybind11::arg("nax_path"), pybind11::arg("gpu_cores"),
++           pybind11::arg("reuse_scratch") = false)
+       .def("forward", &PagedAttention::forward);
+ }
+--- a/vllm_metal/pytorch_backend/mps_ops.py
++++ b/vllm_metal/pytorch_backend/mps_ops.py
+@@ -62,4 +62,7 @@
+             )
+         except (OSError, RuntimeError) as exc:
+             logger.warning("NAX unavailable; using the non-NAX fallback: %s", exc)
+-    return module.PagedAttention(str(path), nax_path, gpu_cores)
++    return module.PagedAttention(
++        str(path), nax_path, gpu_cores,
++        "gpu_ops" in envs.METAL_MODEL_OPTIMIZERS,
++    )
+--- a/vllm_metal/pytorch_backend/normalization.py
++++ b/vllm_metal/pytorch_backend/normalization.py
+@@ -53,6 +53,16 @@
+     variance_size: int | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     assert weight is not None
++    from vllm_metal import envs
++
++    if "gpu_ops" in envs.METAL_MODEL_OPTIMIZERS:
++        from vllm_omni_metal.ops import aot_kernels
++
++        if (
++            aot_kernels._supports_add_rms_norm_epsilon(epsilon)
++            and aot_kernels.supports_add_rms_norm(x, x_residual, weight)
++        ):
++            return aot_kernels.add_rms_norm(x, x_residual, weight, epsilon)
+     # vLLM computes variance from the unrounded FP32 residual sum.
+     summed = x.float() + x_residual.float()
+     # An explicit weight selects PyTorch's fused MPS kernel. Use FP32 ones
+--- a/vllm_metal/pytorch_backend/worker.py
++++ b/vllm_metal/pytorch_backend/worker.py
+@@ -99,6 +99,9 @@
+         if not torch.backends.mps.is_available():
+             raise RuntimeError("The experimental backend requires PyTorch MPS")
+         configure_mps(self.vllm_config)
++        from vllm_metal_extensions.ops.gpu import register_mps_ops
++
++        register_mps_ops(self.vllm_config)
+         self.device = torch.device("mps:0")
+         init_worker_distributed_environment(
+             self.vllm_config,
+--- a/vllm_metal/pytorch_backend/runner.py
++++ b/vllm_metal/pytorch_backend/runner.py
+@@ -34,6 +34,11 @@
+         self.vllm_config.load_config.device = "mps"
+         with set_current_vllm_config(self.vllm_config):
+             super().load_model(*args, **kwargs)
++            from vllm_metal_extensions.model_optimizers import apply_model_optimizers
++
++            self.model_optimizer_metadata = apply_model_optimizers(
++                self.model, self.vllm_config, runtime="mps"
++            )
+ 
+     def initialize_kv_cache(self, kv_cache_config, *args, **kwargs):
+         super().initialize_kv_cache(kv_cache_config, *args, **kwargs)
+--- a/vllm_metal/v1/worker.py
++++ b/vllm_metal/v1/worker.py
+@@ -211,7 +211,15 @@
+ 
+     def load_model(self) -> None:
+         """Load the model onto the Metal device."""
+-        self.model_runner.load_model()
++        try:
++            self.model_runner.load_model()
++        except BaseException:
++            from vllm_metal_extensions.lifecycle import close_model_optimizers
++
++            model = getattr(self.model_runner, "model", None)
++            if model is not None:
++                close_model_optimizers(model)
++            raise
+ 
+     def determine_available_memory(self) -> int:
+         """Determine available memory for KV cache.
+@@ -490,6 +498,13 @@
+             self._metal_profiler.shutdown()
+             self._metal_profiler = None
+ 
++        from vllm_metal_extensions.lifecycle import close_model_optimizers
++
++        runner = getattr(self, "model_runner", None)
++        model = getattr(runner, "model", None)
++        if model is not None:
++            close_model_optimizers(model)
++
+         if hasattr(self, "model_runner") and self.model_runner is not None:
+             del self.model_runner
+             self.model_runner = None

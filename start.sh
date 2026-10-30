@@ -2,20 +2,20 @@
 set -euo pipefail
 cd -- "$(dirname -- "$0")"
 if [ "$#" -gt 1 ]; then
-  echo "用法：./start.sh [gateway|lifecycle|h2o|higgs|yue2|moss|paddleocr|qwenimage|seedvr2|all]" >&2
+  echo "用法：./start.sh [gateway|lifecycle|h2o|higgs|yue2|moss|paddleocr|qwenimage|seedvr2|wevisone|all]" >&2
   exit 1
 fi
 target="${1:-gateway}"
 case "$target" in
   -h|--help)
-    echo "用法：./start.sh [gateway|lifecycle|h2o|higgs|yue2|moss|paddleocr|qwenimage|seedvr2|all]（默认 gateway；模式见 model-lifecycle.json）"
+    echo "用法：./start.sh [gateway|lifecycle|h2o|higgs|yue2|moss|paddleocr|qwenimage|seedvr2|wevisone|all]（默认 gateway；模式见 runtime_mgmt/model-lifecycle.json）"
     exit 0 ;;
-  gateway|lifecycle|h2o|higgs|yue2|moss|paddleocr|qwenimage|seedvr2|all) ;;
+  gateway|lifecycle|h2o|higgs|yue2|moss|paddleocr|qwenimage|seedvr2|wevisone|all) ;;
   *) echo "未知服务：${target}；运行 ./start.sh --help 查看目标。" >&2; exit 1 ;;
 esac
 # H2O 由用户手动下载；缺少新版发布时不触发共享后端升级或启动其他服务。
 if [ "$target" = h2o ] || [ "$target" = all ]; then
-  python3 ./h2o-lightning-4b/prepare.py --check-model >/dev/null
+  python3 ./composes/h2o-lightning-4b/prepare.py --check-model >/dev/null
 fi
 commands=(docker curl launchctl python3)
 for command in "${commands[@]}"; do
@@ -23,16 +23,17 @@ for command in "${commands[@]}"; do
 done
 docker info >/dev/null
 docker compose config --quiet
-python3 -I ./lifecycle_control.py validate
+python3 -I ./runtime_mgmt/lifecycle_control.py validate
 # Every explicit root start rebuilds the shared backend, including gateway/lifecycle.
-backend="$(python3 ./prepare_backend.py)"
+backend="$(python3 -I ./common_env/prepare_backend.py)"
 export VLLM_BACKEND_PYTHON="$backend/bin/python"
-python3 -I ./lifecycle_control.py start
+python3 -I ./runtime_mgmt/lifecycle_control.py start
 if [ "$target" = lifecycle ]; then
-  python3 -I ./lifecycle_control.py status
+  python3 -I ./runtime_mgmt/lifecycle_control.py status
   exit 0
 fi
-if [ "$target" = gateway ] || [ -z "$(docker compose ps --status running --quiet gateway)" ] || \
+if [ "$target" = gateway ] || [ "$target" = wevisone ] || [ "$target" = all ] || \
+    [ -z "$(docker compose ps --status running --quiet gateway)" ] || \
     ! curl --connect-timeout 1 --max-time 2 -fsS http://127.0.0.1/health >/dev/null; then
   docker compose build
   docker compose run --rm --no-deps gateway nginx -t
@@ -74,27 +75,31 @@ start_model() {
     seedvr2)
       directory=seedvr2; label=com.local.seedvr2-metal
       model=seedvr2; port=8100 ;;
+    wevisone)
+      directory=wevisone-vl-4b; label=com.local.wevisone-vl-4b-metal
+      model=wevisone-vl-4b; port=8101 ;;
   esac
-  if [ "$(python3 -I ./lifecycle_control.py mode "$model")" = dynamic ]; then
+  local deployment="composes/$directory"
+  if [ "$(python3 -I ./runtime_mgmt/lifecycle_control.py mode "$model")" = dynamic ]; then
     # Every explicit model start rebuilds the backend and its dependent overlays.
     # Regenerate the selected deployment before validating its cold-start contract.
     echo "$name 重新准备模型私有环境和启动配置；完成后保持冷状态。"
-    "./$directory/start.sh" --prepare-only
-    python3 -I ./lifecycle_control.py check-dynamic "$model"
+    "./$deployment/start.sh" --prepare-only
+    python3 -I ./runtime_mgmt/lifecycle_control.py check-dynamic "$model"
     dynamic_models+=("$model")
     echo "$name 已配置 dynamic；首次推理加载，模型列表查询不唤醒。"
     return
   fi
   if [ "$name" != h2o ] && launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
     if ! curl --connect-timeout 1 --max-time 5 -fsS "http://127.0.0.1:$port/health" >/dev/null; then
-      echo "$name 任务已注册但尚未就绪；请检查日志，必要时先运行 ./$directory/stop.sh。" >&2
+      echo "$name 任务已注册但尚未就绪；请检查日志，必要时先运行 ./$deployment/stop.sh。" >&2
       return 1
     fi
-    python3 ./check_versions.py --omni --plist "$HOME/Library/Application Support/$directory/$label.plist"
+    python3 -I ./common_env/check_versions.py --omni --plist "$HOME/Library/Application Support/$directory/$label.plist"
     echo "$name 已运行，跳过重复加载。"
   else
     echo "启动 ${name}……"
-    "./$directory/start.sh"
+    "./$deployment/start.sh"
   fi
   if [ "$name" = h2o ]; then
     if ! curl --connect-timeout 1 --max-time 5 --retry 5 --retry-all-errors --retry-connrefused --retry-delay 1 \
@@ -110,8 +115,8 @@ start_model() {
 
 case "$target" in
   all)
-    echo "按 model-lifecycle.json 依次部署目标：resident加载，dynamic缺少部署时自动准备；任一步失败停止后续目标。"
-    for service in h2o higgs yue2 moss paddleocr qwenimage seedvr2; do
+    echo "按 runtime_mgmt/model-lifecycle.json 依次部署目标：resident加载，dynamic缺少部署时自动准备；任一步失败停止后续目标。"
+    for service in h2o higgs yue2 moss paddleocr qwenimage seedvr2 wevisone; do
       start_model "$service"
     done ;;
   gateway) ;;
@@ -135,6 +140,6 @@ if missing:
   echo "统一入口校验通过：${models[*]}。"
 fi
 if [ "${#dynamic_models[@]}" -gt 0 ]; then
-  python3 -I ./lifecycle_control.py status
+  python3 -I ./runtime_mgmt/lifecycle_control.py status
   echo "动态目标已登记：${dynamic_models[*]}；未以模型列表冒充冷启动/推理验收。"
 fi

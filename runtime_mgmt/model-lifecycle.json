@@ -1,0 +1,81 @@
+{
+  "services": {
+    "h2o-lightning-4b": {
+      "mode": "resident",
+      "idle_timeout": 300,
+      "upstream": "http://127.0.0.1:8000",
+      "ready_path": "/v1/models",
+      "ready_model": "h2o-lightning-4b",
+      "path_upstreams": {"/v1/systemone": "http://127.0.0.1:8740", "/v1/decisions": "http://127.0.0.1:8740"},
+      "start_command": ["python3", "lifecycle_launch.py", "start", "~/Library/Application Support/h2o-lightning-shim/com.local.h2o-lightning-vllm.plist", "8000"],
+      "stop_command": ["python3", "lifecycle_launch.py", "stop", "~/Library/Application Support/h2o-lightning-shim/com.local.h2o-lightning-vllm.plist", "8000"]
+    },
+    "higgs-audio-v3-tts-4b": {
+      "mode": "dynamic",
+      "idle_timeout": 300,
+      "request_timeout": 600,
+      "upstream": "http://127.0.0.1:8095",
+      "ready_path": "/v1/models",
+      "ready_model": "higgs-audio-v3-tts-4b",
+      "start_command": ["python3", "lifecycle_launch.py", "start", "~/Library/Application Support/higgs-tts-3/com.local.higgs-tts-3-metal.plist", "8095"],
+      "stop_command": ["python3", "lifecycle_launch.py", "stop", "~/Library/Application Support/higgs-tts-3/com.local.higgs-tts-3-metal.plist", "8095"]
+    },
+    "yue2-3b": {
+      "mode": "dynamic",
+      "idle_timeout": 300,
+      "upstream": "http://127.0.0.1:8096",
+      "ready_path": "/v1/models",
+      "ready_model": "yue2-3b",
+      "start_command": ["python3", "lifecycle_launch.py", "start", "~/Library/Application Support/yue2-3b/com.local.yue2-3b-metal.plist", "8096"],
+      "stop_command": ["python3", "lifecycle_launch.py", "stop", "~/Library/Application Support/yue2-3b/com.local.yue2-3b-metal.plist", "8096"]
+    },
+    "moss-transcribe-diarize": {
+      "mode": "dynamic",
+      "idle_timeout": 300,
+      "upstream": "http://127.0.0.1:8097",
+      "ready_path": "/v1/models",
+      "ready_model": "moss-transcribe-diarize",
+      "start_command": ["python3", "lifecycle_launch.py", "start", "~/Library/Application Support/moss-transcribe-diarize/com.local.moss-transcribe-diarize-metal.plist", "8097"],
+      "stop_command": ["python3", "lifecycle_launch.py", "stop", "~/Library/Application Support/moss-transcribe-diarize/com.local.moss-transcribe-diarize-metal.plist", "8097"]
+    },
+    "paddleocr-vl": {
+      "mode": "dynamic",
+      "idle_timeout": 300,
+      "upstream": "http://127.0.0.1:8098",
+      "ready_path": "/v1/models",
+      "ready_model": "paddleocr-vl",
+      "start_command": ["python3", "lifecycle_launch.py", "start", "~/Library/Application Support/paddleocr-vl/com.local.paddleocr-vl-metal.plist", "8098"],
+      "stop_command": ["python3", "lifecycle_launch.py", "stop", "~/Library/Application Support/paddleocr-vl/com.local.paddleocr-vl-metal.plist", "8098"]
+    },
+    "qwen-image-2.1-turbo": {
+      "mode": "dynamic",
+      "idle_timeout": 300,
+      "upstream": "http://127.0.0.1:8099",
+      "ready_path": "/v1/models",
+      "ready_model": "qwen-image-2.1-turbo",
+      "start_command": ["python3", "lifecycle_launch.py", "start", "~/Library/Application Support/qwen-image-2.1-turbo/com.local.qwen-image-2.1-turbo-metal.plist", "8099", "--min-free-gib", "36"],
+      "stop_command": ["python3", "lifecycle_launch.py", "stop", "~/Library/Application Support/qwen-image-2.1-turbo/com.local.qwen-image-2.1-turbo-metal.plist", "8099"]
+    },
+    "seedvr2": {
+      "mode": "dynamic",
+      "idle_timeout": 300,
+      "startup_timeout": 1800,
+      "upstream": "http://127.0.0.1:8100",
+      "ready_path": "/v1/models",
+      "ready_model": "seedvr2",
+      "start_command": ["python3", "lifecycle_launch.py", "start", "~/Library/Application Support/seedvr2/com.local.seedvr2-metal.plist", "8100", "--min-free-gib", "24"],
+      "stop_command": ["python3", "lifecycle_launch.py", "stop", "~/Library/Application Support/seedvr2/com.local.seedvr2-metal.plist", "8100"]
+    },
+    "wevisone-vl-4b": {
+      "mode": "dynamic",
+      "idle_timeout": 300,
+      "startup_timeout": 600,
+      "request_timeout": 1800,
+      "upstream": "http://127.0.0.1:8101",
+      "ready_path": "/v1/models",
+      "ready_model": "wevisone-vl-4b",
+      "start_command": ["python3", "lifecycle_launch.py", "start", "~/Library/Application Support/wevisone-vl-4b/com.local.wevisone-vl-4b-metal.plist", "8101"],
+      "stop_command": ["python3", "lifecycle_launch.py", "stop", "~/Library/Application Support/wevisone-vl-4b/com.local.wevisone-vl-4b-metal.plist", "8101"]
+    }
+  }
+}

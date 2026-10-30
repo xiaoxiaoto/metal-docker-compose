@@ -1,0 +1,267 @@
+# H2O Lightning：本机 vLLM Metal + 官方 shim
+
+
+## 共享优化接入（默认关闭）
+
+本目录的基础vLLM Metal加载器已接入显式provider合同；扩展的功能分包、兼容与验收规则见根
+`AGENTS.md`。启动时将公共 `METAL_MODEL_OPTIMIZERS`、`METAL_QUANTIZATION`、
+`METAL_QUANTIZATION_PROFILE`、`METAL_ANE_PROFILE`、`METAL_STREAMING_PROFILE` 固化到 plist。
+默认量化 off、provider 列表为空；dynamic 须显式选择 `dynamic_quantization` 并提供绝对路径批准 profile，
+ANE 和 streaming 同样须显式选择各自 provider 并提供绝对路径 profile。
+没有完整真实任务批准的匹配profile时保持off，不因局部算子或随机模型通过而启用。
+
+H2O 不保留私有 ANE／动态量化推理适配器；量化使用
+`vllm_metal_extensions.model_optimizers` 加载入口和
+`vllm_metal_extensions.quantization.mlx` 原生 MLX 实现，不通过 Torch 桥接执行量化推理。
+公共扩展源码位于部署项目根目录 `../../extensions/`，基础 Metal 包目录为 `../../extensions/vllm_metal/`；
+`vllm-metal-extensions` 是正确的 distribution name，不是源码目录名。扩展由根
+`pyproject.toml`／`uv.lock` 非 editable 安装，私有 overlay 从共享环境继承；
+Metal/Omni Metal 升级必须重新审查兼容合同与验收，不能绕过不支持检查。
+旧实验 profile 不用于公共路径；无完整任务批准时继续保持 off。扩展代码新增 ANE/GPU/
+streaming 接口不等于 H2O 已启用这些能力或已通过质量验收。双向注意力、真正 FP32 输出头
+与官方 shim 继续保留，不属于可迁移的通用优化。
+
+本部署不提供 H2O 的动态量化离线准备器或任务批准 profile。共享
+`MLXDynamicEngine.search` 要求调用方提供至少四个真实执行步骤的投影输入；它不负责
+在 vLLM worker 中捕获输入、执行 H2O 业务任务 A/B 或验证资源释放。局部搜索结果的
+`approved` 为 false，不能当作生产批准；手工改写该字段或复用其他模型的 profile
+也不能代替完整验收。实现准备流程需要在与生产一致的 H2O 私有 worker 中捕获实际输入，
+并对双向与因果决策、文本及 BOX 等实际任务比较输出质量、有效性、性能、峰值内存与
+进程退出后的资源释放；其中 BOX 需要实际图片及可核对的定位结果。完成这些工作前
+保持量化 off，不应将公共 provider 的存在视作模型已完成校准。
+
+
+来源：[H2O.ai 官方模型卡](https://huggingface.co/h2oai/h2o-lightning-4b)。本部署同步 **v1.3.1 权重**与官方 main tooling，统一固定到 commit [`e7b32490c9d2a994bd75a4d1ea7e45716080175e`](https://huggingface.co/h2oai/h2o-lightning-4b/tree/e7b32490c9d2a994bd75a4d1ea7e45716080175e)。对外模型 ID 保持 `h2o-lightning-4b`，端口和 launchctl label 不变。
+
+部署目录位于 `composes/h2o-lightning-4b/`，启停简称为 `h2o`，运行时目录为 `~/Library/Application Support/h2o-lightning-shim/`，Compose 项目名与容器名均为 `h2o-lightning-shim`。
+
+模型由用户通过 Hugging Face 手动下载，启动器不自动下载权重。
+
+## 手动下载官方发布
+
+使用已有 Hugging Face CLI（`hf`）；不要把新的依赖装进共享后端或系统 Python。以下命令仅供稍后手动执行，主权重约 **9.32 GB**，需预留下载空间。固定同一 commit 的权重、配置和 shim，不要只下载 `model.safetensors`，也不要把 `v1.3.1` tag 的旧 tooling 与 main 混用：
+
+```bash
+hf download h2oai/h2o-lightning-4b \
+  --revision e7b32490c9d2a994bd75a4d1ea7e45716080175e \
+  model.safetensors config.json generation_config.json tokenizer.json tokenizer_config.json \
+  chat_template.jinja merges.txt vocab.json preprocessor_config.json video_preprocessor_config.json \
+  serve_config.json h2o_lightning_shim.py assets.py box.py pooled_readout.py example_receipt.png
+```
+
+默认使用 HF 标准缓存 `~/.cache/huggingface/hub/models--h2oai--h2o-lightning-4b/snapshots/<上述 commit>/`；支持 `HF_HUB_CACHE`、`HF_HOME`、`XDG_CACHE_HOME`。下载和启动时保持相同环境变量。若用 `hf download ... --local-dir /实际目录`，启动时 `export H2O_MODEL_DIR=/实际目录`，覆盖自动缓存位置。
+
+可在不启动服务、不联网的情况下先检查：
+
+```bash
+python3 composes/h2o-lightning-4b/prepare.py --check-model
+```
+
+`model-release.json` 记录官方 API 提供的文件大小、Git blob ID 与 LFS SHA256。准备器流式核对全部必需文件（包括完整权重），不执行缓存里的代码、不反序列化 pickle，不自动下载或覆盖文件。HF 快照允许链接到同仓库 `blobs/`，其他外链拒绝；Compose 只读挂载该仓库根目录，保留快照相对链接，避免容器内断链。普通 `--local-dir` 目录直接只读挂载。缺文件、LFS 指针、摘要不符、旧 shim 或混入旧 `label_rows.safetensors` 等额外权重均明确失败。
+
+## 运行合同与启停
+
+需要 Apple Silicon、macOS ≥ 15、Python ≥ 3.11（根控制脚本与启动引导）、Docker Desktop 和 uv 托管的 Python `>=3.12,<3.13` 共享后端。共享依赖仅由根目录 [`pyproject.toml`](../../pyproject.toml) / [`uv.lock`](../../uv.lock) 声明，使用 `uv sync --locked` 非 editable 安装；vLLM/Metal 为 `0.32.0`，Omni 固定 `9842ebc17cf1d9c6b440ecb6a79039162f68a1dd`，Omni Metal 来自 `https://github.com/xiaoxiaoto/vllm-omni-metal.git` 的 `5774df7d720b3a8c6d32035729b42c31e480f346`，不依赖相邻源码。保留官方联网预检，不随 main 自动升级，MPS 与 `pip check` 等验证通过后才激活；私有补丁 wheel 流程不变，详见[根目录合同](../../README.md)。规范 ID 为 **`h2o-lightning-4b`**，原生 vLLM Metal 本机端口 `8000`、官方 shim `127.0.0.1:8740`、统一入口 `http://127.0.0.1/v1/`。
+
+vLLM 与 vllm-metal 也从官方 GitHub 源码安装，分别固定 `vllm-project/vllm` 的 `5df63a7203cdb9328d824a27b682e77c7b9928be` 与 `vllm-project/vllm-metal` 的 `6d6f2c37f8242f1ff1a336534adf6c2d2fe2936d`（v0.32.0）；由 uv 隔离构建非 editable wheel，不使用官方预编译 wheel。vLLM 的 CPU 编译形态只是 Metal 插件底座，不代表模型 CPU fallback。
+
+- **同一 vLLM Metal 引擎支持 two-way、one-way 与 BOX 三条路径。** shim 默认 `bidirectional`；请求 `attention_mode=bidirectional` / `two-way` 使用全注意力层双向读出，`causal` / `one-way` 使用单向读出，GDN 始终因果。BOX 是 `type=box` 的图像定位题，不是第三种 attention；它使用同一引擎的因果多 token 生成，再由官方 shim 解析坐标、校准置信度和读取目标存在概率。
+- `../../extensions/vllm_metal/patches/h2o-lightning-4b-bidirectional.patch` 基于官方 `vllm-metal v0.32.0` commit `6d6f2c37f8242f1ff1a336534adf6c2d2fe2936d`，不引入社区 MLX facade、其他 server 或 CUDA/Triton fork。
+- 为保证双向语义，显式启用 `--additional-config '{\"bidirectional_attention\":true}'`，整个引擎关闭 prefix caching 与 chunked prefill，使用 `mamba-cache-mode=none`，40960 上下文与同等整段 batch token 预算。**取舍是 one-way 也不复用前缀缓存**；不声称实现官方 CUDA fork 的请求级缓存优化。双向仅允许单 token 读出，不用于自回归生成；量化 KV、speculative、PP/TP/DP、KV transfer 等未支持组合明确拒绝，不静默回退。
+- 保留官方配置：题型温度 `choice=0.75`、`noul=0.8`、`score=0.65`，真假概率 floor `0.801`，图像温度 `0.65`；模型权重和 embedding lookup 保持 BF16，补丁按 `head_dtype=float32` 实施真正 FP32 输出投影，不是 BF16 计算后转型，不放宽官方 three-probe 容差。
+- BOX 通过 `LIGHTNING_BOX_ENABLED=1` 开启，保留官方 `generate`、`generation` 置信度校准与 `presence` 设置；Compose 镜像增加固定 Pillow `13.0.0`，以支持官方绘框路径。保留每次最多4张图、每张1048576像素、`max-logprobs=128`、4并发和 `gpu-memory-utilization=0.55`。这些不是官方 H100 性能或基准结果的复现。
+- 根目录 `./start.sh h2o` 每次离线校验权重后重建共享环境：安全停止生命周期管理器及全部依赖模型，删除历史共享环境和私有 overlay，再安装验证共享后端，随后构建 H2O 私有补丁 wheel 并加载。停止失败不删除；构建失败不回退旧环境。权重、下载缓存、量化资产和日志保留。缺权重时不重建、不启服务；详见[根目录重建合同](../../README.md#每次根目录启动前重建共享环境)。
+- 共享后端准备阶段会继承 macOS 系统 HTTP/HTTPS 代理，显式环境变量优先，保留 TLS 校验；无需在代码里填写代理端口。代理程序须已运行。首次后端安装完成前网关可能尚未监听，应等待 `./start.sh h2o` 最终成功，再执行下方身份检查与真实推理 curl。
+- vLLM 由 `com.local.h2o-lightning-vllm` 管理，plist 位于 `~/Library/Application Support/h2o-lightning-shim/`，日志为 `~/Library/Logs/h2o-lightning-vllm.log` 和 `.error.log`。保持离线加载、`spawn`、有限等待和失败时只清理本次启动服务。已注册但不健康、配置不匹配或端口被其他进程占用时拒绝接管，不自动杀进程或覆盖运行配置。
+- H2O 是根目录 `runtime_mgmt/model-lifecycle.json` 中的 `resident`：不自动加载或空闲卸载。`/v1/systemone` 与精确 `/v1/decisions` 经生命周期代理转到 shim；后者必须通过 model 校验。`/v1/chat/completions`、`/v1/completions`、单模型 `/v1/models` 仍到 vLLM，不经过 shim 的提示构造、概率校准与类型转换。
+
+### 补丁式安装边界
+
+`prepare_runtime.py` 从固定官方 commit 导出干净副本（不覆盖相邻源码工作区），先 `git apply --check`，再应用补丁；补丁只添加请求级 attention mode 合同/调度与原生 FP32 head，不改 Metal shader。基础 Metal 必须从同一官方仓库/commit 非 editable 安装；共享 `common_env/prepare_native.py` 显式编译原生扩展与 `.metallib` 并登记 RECORD，本准备器复用这些经 SHA256/大小校验的同 ABI 产物。原生源码必须逐字匹配，不能把旧二进制配给变化的 shader，不再接受旧的预编译 Release wheel 来源。Python 改动通过非 editable wheel 安装到 `~/.local/share/local-model-backend/overlays/h2o-lightning-4b/<fingerprint>/`，其余依赖通过现有 `.pth` 模式继承共享基础环境。
+
+wheel 构建后逐文件比对归档与固定源码副本（包含 native resources），安装后校验私有模块路径、源码摘要、RECORD 与原生扩展加载；私有 `bin/vllm` launcher 指向该 overlay 的 Python。每次复用都重新检查版本、`pip check` 和加载，只有全部通过才发布 `.ready`。指纹覆盖固定基线、补丁、准备器、基础发行资源和解释器；不会修改已安装基础包、Homebrew、共享 `current` 或其他模型的 overlay；请求期间不下载、不打补丁、不编译。缺补丁、基线不匹配、依赖冲突或资源损坏均明确失败。
+
+根目录启动现在统一负责安全排空、停用依赖模型、删除历史环境并重建，不需要手动先停 H2O。重建期间统一入口不可用，构建失败不会回退旧环境；在根目录执行：
+
+```bash
+./start.sh h2o
+```
+
+停止 lifecycle 会影响统一入口，有在途请求时拒绝停止。根目录每次启动（包括默认/gateway/lifecycle）都会安全停止所有依赖模型并删除历史环境重建；单目标只恢复 H2O，其余模型不自动恢复。不要连续执行多个根目录启动命令并期待前一个模型仍运行。
+
+**验证边界：** 私有 wheel/RECORD、模块归属和原生 Metal 扩展加载检查不能替代真实推理。FP32 head 使用模型原生 forward 验证实际投影，不要求模型支持缺少原生 cache/位置初始化的独立 backbone 调用；不改变 selective logits 的能力门禁，不放宽官方 three-probe。
+
+## 统一入口验收
+
+以下示例与根目录 README 保持一致。先完成 HF 手动下载与上节启动/重载，再执行统一入口 curl；每组先查聚合列表和单模型身份，不用 `/health` 代替模型与真实推理验收。推理 JSON 直接显示在终端，不保存结果文件。
+
+**Two-way：SystemOne choice / noul / score。** `/v1/systemone` 无需 `model`，使用 `state` 和对象形式的 `questions`；下例显式选择双向，一次询问优先级、是否影响所有客户与紧急程度。改成 `causal` 即可对同一请求比较 one-way；省略该字段默认双向。
+
+```bash
+set -o pipefail
+curl --fail-with-body --show-error --connect-timeout 5 --max-time 10 \
+  'http://127.0.0.1/v1/models'
+
+curl --fail-with-body --show-error --connect-timeout 5 --max-time 10 \
+  --get 'http://127.0.0.1/v1/models' \
+  --data-urlencode 'model=h2o-lightning-4b'
+
+curl --fail-with-body --show-error --connect-timeout 5 --max-time 1800 \
+  'http://127.0.0.1/v1/systemone' \
+  --header 'Content-Type: application/json' \
+  --data-binary '{
+    "state": "工单 4471：结账页面对所有客户返回 HTTP 500，已持续 40 分钟，没有订单成功。严重等级：P1 为营收路径完全不可用，P2 为降级但仍可用，P3 为外观问题。",
+    "attention_mode": "bidirectional",
+    "effort": "fast",
+    "questions": {
+      "priority": {
+        "type": "choice",
+        "instructions": "根据严重等级定义，这个工单应分配哪个优先级？",
+        "criteria": {
+          "p1": "营收路径完全不可用",
+          "p2": "降级但仍可用",
+          "p3": "外观问题"
+        }
+      },
+      "all_users": {
+        "type": "noul",
+        "instructions": "该问题影响所有客户。",
+        "criteria": {"true": "影响所有客户", "false": "仅影响部分客户"}
+      },
+      "urgency": {
+        "type": "score",
+        "instructions": "这个工单有多紧急？",
+        "criteria": ["低", "中", "高"]
+      }
+    }
+  }' | \
+  python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin), ensure_ascii=False, indent=2))'
+```
+
+成功需 HTTP 200、`model=h2o-lightning-4b`、`attention_mode=bidirectional`、`probability_source=native` 与有效 `usage`；官方启动探针必须通过，失败返回503，不能绕过。`answers` 是以问题名为键的对象：`answers.priority.choice` 应为 `p1`，`answers.all_users.noul` 是 `[0,1]` 内的真假概率，`answers.urgency.score` 是 `[0,2]` 内的等级期望值。choice 与 score 的概率分布应非负且归一化；缩进展示不替代字段与数值检查。
+
+**One-way：官方 OpenAI Decisions predicate / choice / score。** 精确 `/v1/decisions` 必须提供 `model=h2o-lightning-4b`，使用 `input` 与数组形式 `questions`，不是 SystemOne 的 `state` / 对象形式 `questions`。三种题型分别使用真假命题、`choices` 和 `levels`；下例显式指定 `attention_mode=causal`，也可改成 `bidirectional`。
+
+```bash
+set -o pipefail
+curl --fail-with-body --show-error --connect-timeout 5 --max-time 10 \
+  'http://127.0.0.1/v1/models'
+
+curl --fail-with-body --show-error --connect-timeout 5 --max-time 10 \
+  --get 'http://127.0.0.1/v1/models' \
+  --data-urlencode 'model=h2o-lightning-4b'
+
+curl --fail-with-body --show-error --connect-timeout 5 --max-time 1800 \
+  'http://127.0.0.1/v1/decisions' \
+  --header 'Content-Type: application/json' \
+  --data-binary '{
+    "model": "h2o-lightning-4b",
+    "attention_mode": "causal",
+    "input": "结账页面对所有客户返回 HTTP 500，没有订单成功。支付系统负责结账，网页团队负责页面外观，支持团队负责咨询。",
+    "questions": [
+      {
+        "type": "predicate",
+        "name": "outage",
+        "instructions": "这是影响所有客户的完整故障。"
+      },
+      {
+        "type": "choice",
+        "name": "team",
+        "instructions": "哪个团队应该负责处理？",
+        "choices": [
+          {"value": "payments", "description": "支付系统团队"},
+          {"value": "web", "description": "网页外观团队"},
+          {"value": "support", "description": "客户支持团队"}
+        ]
+      },
+      {
+        "type": "score",
+        "name": "urgency",
+        "instructions": "这个工单有多紧急？",
+        "levels": [{"label": "低"}, {"label": "中"}, {"label": "高"}]
+      }
+    ]
+  }' | \
+  python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin), ensure_ascii=False, indent=2))'
+```
+
+成功需 HTTP 200、模型身份匹配和有效 `usage`。Decisions 的 **`answers` 是数组**，按每项的 `name` 对应问题：`outage` 的 `probability` 在 `[0,1]` 内，`team.choice` 应为 `payments`，`urgency.score` 在 `[0,2]` 内；choice/score 的 `probabilities` 也是有效分布数组。这里的 `team.choice` 表示 `name=team` 那项的字段，并非对象路径。此接口不返回 SystemOne 的顶层 `attention_mode` 或 `probability_source`，也不使用 Chat Completions 的 `choices`。缺失/冲突/重复 model 返回 400，未知 model 返回 404，不支持请求体类型返回 415，模型请求超限返回 413；其他模型不支持此 Decisions 路由，尾斜杠不能绕过。
+
+**标准聊天：** `/v1/chat/completions` 使用 `model` / `messages`，直接转到 vLLM，不执行 shim 的提示构造、概率校准或类型化转换，不传 `attention_mode`。
+
+```bash
+set -o pipefail
+curl --fail-with-body --show-error --connect-timeout 5 --max-time 10 \
+  'http://127.0.0.1/v1/models'
+
+curl --fail-with-body --show-error --connect-timeout 5 --max-time 10 \
+  --get 'http://127.0.0.1/v1/models' \
+  --data-urlencode 'model=h2o-lightning-4b'
+
+curl --fail-with-body --show-error --connect-timeout 5 --max-time 1800 \
+  'http://127.0.0.1/v1/chat/completions' \
+  --header 'Content-Type: application/json' \
+  --data-binary '{
+    "model": "h2o-lightning-4b",
+    "messages": [
+      {
+        "role": "system",
+        "content": "你是决策引擎。读取工单并选择一个优先级，仅回复选项字母。"
+      },
+      {
+        "role": "user",
+        "content": "工单：结账页面对所有客户返回 HTTP 500，没有订单成功。应该按哪个优先级处理？\nA) P1：营收路径完全不可用，需要立即处理\nB) P2：降级但仍可用，可以稍后处理\nC) P3：仅外观问题，不影响业务"
+      }
+    ],
+    "temperature": 0,
+    "max_tokens": 64,
+    "stream": false
+  }' | \
+  python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin), ensure_ascii=False, indent=2))'
+```
+
+成功需 HTTP 200、`model=h2o-lightning-4b`、有效 `usage` 与 `choices[0].message.content`；本例应选 `A`。标准接口兼容不代表通用聊天能力；需要概率与类型化答案时使用上面的决策接口。
+
+**标准文本补全：** `/v1/completions` 使用 `prompt`，不使用 `messages`、`state`、`questions` 或 `attention_mode`。它仍直接到 vLLM，不执行 shim 校准；如需类型化答案和概率，优先使用上面的决策接口。
+
+```bash
+set -o pipefail
+curl --fail-with-body --show-error --connect-timeout 5 --max-time 10 \
+  'http://127.0.0.1/v1/models'
+
+curl --fail-with-body --show-error --connect-timeout 5 --max-time 10 \
+  --get 'http://127.0.0.1/v1/models' \
+  --data-urlencode 'model=h2o-lightning-4b'
+
+curl --fail-with-body --show-error --connect-timeout 5 --max-time 1800 \
+  'http://127.0.0.1/v1/completions' \
+  --header 'Content-Type: application/json' \
+  --data-binary '{"model":"h2o-lightning-4b","prompt":"仅回复选项字母：结账页面对所有客户返回 HTTP 500，没有订单成功，应选 A) P1：营收路径完全不可用 还是 B) P3：仅外观问题？\n答案：","temperature":0,"max_tokens":64,"stream":false}' | \
+  python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin), ensure_ascii=False, indent=2))'
+```
+
+成功需 HTTP 200、`model=h2o-lightning-4b`、有效 `usage` 和 `choices[0].text`；本例应选 `A`。标准聊天读取 `choices[0].message.content`，文本补全读取 `choices[0].text`，不能混用。所有示例均先完成 HF 下载与 `./start.sh h2o`。
+
+**BOX：图像目标定位。** 使用 `/v1/systemone` 的 `type=box`，不是 `/v1/decisions` 的题型。先把 `IMAGE` 替换为包含待定位目标的实际 PNG 文件，先用小图；BOX 在同一 vLLM Metal 引擎执行因果生成，即使默认决策模式为 two-way。
+
+```bash
+set -o pipefail
+curl --fail-with-body --show-error --connect-timeout 5 --max-time 10 \
+  'http://127.0.0.1/v1/models'
+
+curl --fail-with-body --show-error --connect-timeout 5 --max-time 10 \
+  --get 'http://127.0.0.1/v1/models' \
+  --data-urlencode 'model=h2o-lightning-4b'
+
+IMAGE="/实际路径/图片.png"
+IMAGE_BASE64="$(base64 < "$IMAGE" | tr -d '\n')"
+printf '{"state":{"photo":"data:image/png;base64,%s"},"attention_mode":"causal","questions":{"target":{"type":"box","instructions":"定位 `photo` 中的咖啡杯。"}}}' "$IMAGE_BASE64" | \
+  curl --fail-with-body --show-error --connect-timeout 5 --max-time 1800 \
+    'http://127.0.0.1/v1/systemone' \
+    --header 'Content-Type: application/json' \
+    --data-binary @- | \
+  python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin), ensure_ascii=False, indent=2))'
+```
+
+成功需 HTTP 200、正确模型和 `attention_mode=causal`；`answers.target` 包含 `type=box`、`box.left/top/right/bottom`、`confidence` 与 `present`。坐标是相对图像左上角的 `[0,1]` 比例，边界应有序，概率应有限且在 `[0,1]`；还须结合图片确认确实框住目标。全图框且置信度0不证明定位成功。返回 JSON，不输出图片文件。
+

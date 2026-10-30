@@ -1,5 +1,9 @@
+[build-system]
+requires = ["setuptools>=77,<81"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "metal-docker-compose"
+name = "vllm-metal-extensions"
 version = "0.1.0"
 description = "Apple Silicon 本机模型部署与共享后端依赖"
 readme = "README.md"
@@ -7,7 +11,7 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "vllm==0.32.0+cpu",
     "vllm-metal==0.32.0",
-    "vllm-omni==0.32.0.dev0+cpu",
+    "vllm-omni==0.32.0.dev0",
     "vllm-omni-metal==0.32.0.dev0",
     "pip>=25.3",
     "setuptools>=77,<81",
@@ -15,7 +19,18 @@ dependencies = [
 
 [tool.uv]
 required-version = ">=0.11.7"
-package = false
+package = true
+# uv caches the project build; deployment scripts/configs are source-tree resources
+# under composes/, while setuptools packages only the explicitly listed extensions.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "README.md" },
+    { file = "extensions/**/*.py" },
+    { file = "composes/**/*.py" },
+    { file = "composes/**/*.sh" },
+    { file = "composes/**/*.yaml" },
+    { file = "composes/**/*.yml" },
+]
 environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
 required-environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
 # uv 会提前读取非目标平台的直接 URL；本项目不支持 Linux x86_64。
@@ -31,3 +46,20 @@ vllm-omni-metal = { git = "https://github.com/xiaoxiaoto/vllm-omni-metal.git", r
 [tool.uv.extra-build-variables]
 vllm = { VLLM_TARGET_DEVICE = "cpu", VLLM_VERSION_OVERRIDE = "0.32.0+cpu", VLLM_USE_PRECOMPILED = "0", VLLM_USE_PRECOMPILED_RUST = "0" }
 vllm-omni = { VLLM_OMNI_TARGET_DEVICE = "cpu", VLLM_OMNI_VERSION_OVERRIDE = "0.32.0.dev0+cpu" }
+
+[project.entry-points."vllm_metal.model_optimizers"]
+dynamic_quantization = "vllm_metal_extensions.quantization.provider:configure_vllm_model"
+gpu_ops = "vllm_metal_extensions.ops.gpu:install"
+ane = "vllm_metal_extensions.ane:apply"
+streaming = "vllm_metal_extensions.execution.streaming:configure_vllm_model"
+
+[tool.setuptools]
+packages = [
+    "vllm_metal_extensions",
+    "vllm_metal_extensions.ane",
+    "vllm_metal_extensions.execution",
+    "vllm_metal_extensions.ops",
+    "vllm_metal_extensions.quantization",
+]
+include-package-data = false
+package-dir = { vllm_metal_extensions = "extensions/vllm_metal" }

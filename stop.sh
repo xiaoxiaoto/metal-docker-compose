@@ -2,15 +2,15 @@
 set -euo pipefail
 cd -- "$(dirname -- "$0")"
 if [ "$#" -gt 1 ]; then
-  echo "用法：./stop.sh [gateway|lifecycle|h2o|higgs|yue2|moss|paddleocr|qwenimage|seedvr2|all]" >&2
+  echo "用法：./stop.sh [gateway|lifecycle|h2o|higgs|yue2|moss|paddleocr|qwenimage|seedvr2|wevisone|all]" >&2
   exit 1
 fi
 target="${1:-gateway}"
 case "$target" in
   -h|--help)
-    echo "用法：./stop.sh [gateway|lifecycle|h2o|higgs|yue2|moss|paddleocr|qwenimage|seedvr2|all]（默认 gateway；lifecycle 拒绝中断在途请求）"
+    echo "用法：./stop.sh [gateway|lifecycle|h2o|higgs|yue2|moss|paddleocr|qwenimage|seedvr2|wevisone|all]（默认 gateway；lifecycle 拒绝中断在途请求）"
     exit 0 ;;
-  gateway|lifecycle|h2o|higgs|yue2|moss|paddleocr|qwenimage|seedvr2|all) ;;
+  gateway|lifecycle|h2o|higgs|yue2|moss|paddleocr|qwenimage|seedvr2|wevisone|all) ;;
   *) echo "未知服务：${target}；运行 ./stop.sh --help 查看目标。" >&2; exit 1 ;;
 esac
 
@@ -21,7 +21,7 @@ stop_service() {
   case "$1" in
     gateway|lifecycle) ;;
     *)
-      if python3 -I ./lifecycle_control.py unload "$1"; then
+      if python3 -I ./runtime_mgmt/lifecycle_control.py unload "$1"; then
         return 0
       else
         result=$?
@@ -30,21 +30,22 @@ stop_service() {
   esac
   case "$1" in
     gateway) docker compose down ;;
-    lifecycle) python3 -I ./lifecycle_control.py stop ;;
-    h2o) ./h2o-lightning-4b/stop.sh ;;
-    higgs) ./higgs-tts-3/stop.sh ;;
-    yue2) ./yue2-3b/stop.sh ;;
-    moss) ./moss-transcribe-diarize/stop.sh ;;
-    paddleocr) ./paddleocr-vl/stop.sh ;;
-    qwenimage) ./qwen-image-2.1-turbo/stop.sh ;;
-    seedvr2) ./seedvr2/stop.sh ;;
+    lifecycle) python3 -I ./runtime_mgmt/lifecycle_control.py stop ;;
+    h2o) ./composes/h2o-lightning-4b/stop.sh ;;
+    higgs) ./composes/higgs-tts-3/stop.sh ;;
+    yue2) ./composes/yue2-3b/stop.sh ;;
+    moss) ./composes/moss-transcribe-diarize/stop.sh ;;
+    paddleocr) ./composes/paddleocr-vl/stop.sh ;;
+    qwenimage) ./composes/qwen-image-2.1-turbo/stop.sh ;;
+    seedvr2) ./composes/seedvr2/stop.sh ;;
+    wevisone) ./composes/wevisone-vl-4b/stop.sh ;;
   esac
 }
 
 services=("$target")
 if [ "$target" = all ]; then
   # Close the entry point first, then unload models in reverse startup order.
-  services=(gateway lifecycle seedvr2 qwenimage paddleocr moss yue2 higgs h2o)
+  services=(gateway lifecycle wevisone seedvr2 qwenimage paddleocr moss yue2 higgs h2o)
 fi
 status=0
 for service in "${services[@]}"; do

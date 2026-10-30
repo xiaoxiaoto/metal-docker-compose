@@ -1100,29 +1100,6 @@ wheels = [
 ]
 
 [[package]]
-name = "metal-docker-compose"
-version = "0.1.0"
-source = { virtual = "." }
-dependencies = [
-    { name = "pip", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
-    { name = "setuptools", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
-    { name = "vllm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
-    { name = "vllm-metal", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
-    { name = "vllm-omni", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
-    { name = "vllm-omni-metal", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "pip", specifier = ">=25.3" },
-    { name = "setuptools", specifier = ">=77,<81" },
-    { name = "vllm", url = "https://github.com/vllm-project/vllm/archive/5df63a7203cdb9328d824a27b682e77c7b9928be.tar.gz" },
-    { name = "vllm-metal", git = "https://github.com/vllm-project/vllm-metal.git?rev=6d6f2c37f8242f1ff1a336534adf6c2d2fe2936d" },
-    { name = "vllm-omni", git = "https://github.com/vllm-project/vllm-omni.git?rev=9842ebc17cf1d9c6b440ecb6a79039162f68a1dd" },
-    { name = "vllm-omni-metal", git = "https://github.com/xiaoxiaoto/vllm-omni-metal.git?rev=5774df7d720b3a8c6d32035729b42c31e480f346" },
-]
-
-[[package]]
 name = "miniaudio"
 version = "1.71"
 source = { registry = "https://pypi.org/simple" }
@@ -2907,6 +2884,29 @@ dependencies = [
     { name = "safetensors", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
     { name = "starlette", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
     { name = "transformers", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
+]
+
+[[package]]
+name = "vllm-metal-extensions"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "pip", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
+    { name = "setuptools", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
+    { name = "vllm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
+    { name = "vllm-metal", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
+    { name = "vllm-omni", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
+    { name = "vllm-omni-metal", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "pip", specifier = ">=25.3" },
+    { name = "setuptools", specifier = ">=77,<81" },
+    { name = "vllm", url = "https://github.com/vllm-project/vllm/archive/5df63a7203cdb9328d824a27b682e77c7b9928be.tar.gz" },
+    { name = "vllm-metal", git = "https://github.com/vllm-project/vllm-metal.git?rev=6d6f2c37f8242f1ff1a336534adf6c2d2fe2936d" },
+    { name = "vllm-omni", git = "https://github.com/vllm-project/vllm-omni.git?rev=9842ebc17cf1d9c6b440ecb6a79039162f68a1dd" },
+    { name = "vllm-omni-metal", git = "https://github.com/xiaoxiaoto/vllm-omni-metal.git?rev=5774df7d720b3a8c6d32035729b42c31e480f346" },
 ]
 
 [[package]]
